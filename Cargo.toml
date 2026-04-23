@@ -1,0 +1,25 @@
+[package]
+name = "soroban-fork"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Lazy-loading mainnet/testnet fork for Soroban tests — an Anvil-equivalent for Stellar."
+authors = ["Alex Kraiz <selfsurfer@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lobotomoe/soroban-fork"
+homepage = "https://github.com/lobotomoe/soroban-fork"
+documentation = "https://docs.rs/soroban-fork"
+readme = "README.md"
+keywords = ["stellar", "soroban", "testing", "fork", "blockchain"]
+categories = ["development-tools::testing", "simulation"]
+
+[dependencies]
+soroban-env-host = { version = "25.0.1", features = ["testutils"] }
+soroban-sdk = { version = "25.3.0", features = ["testutils"] }
+soroban-ledger-snapshot = "25.3.0"
+stellar-xdr = { version = "=25.0.0", default-features = false, features = ["std", "serde"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+stellar-strkey = "0.0.16"

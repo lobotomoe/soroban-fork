@@ -1,0 +1,13 @@
+# Rust build output
+target/
+
+# Library crates: let downstream projects resolve their own dep versions.
+Cargo.lock
+
+# Mainnet-fork test snapshots (auto-regenerated every run).
+test_snapshots/test_*.json
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
