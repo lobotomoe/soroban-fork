@@ -104,8 +104,9 @@ fn format_amount(raw: i128, decimals: u32) -> String {
 /// Simple: read token metadata from the three major Stellar tokens.
 /// Demonstrates basic lazy-fetch: instance + WASM + storage per token.
 #[test]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
 fn test_token_metadata() {
-    let env = ForkConfig::new(&mainnet_rpc()).build();
+    let env = ForkConfig::new(mainnet_rpc()).build().expect("fork setup");
     env.mock_all_auths();
 
     let xlm = addr(&env, XLM_SAC);
@@ -135,8 +136,9 @@ fn test_token_metadata() {
 /// Medium: measure how much capital is locked in Blend Protocol pools.
 /// Cross-contract queries: call `balance()` on token contracts with pool addresses.
 #[test]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
 fn test_blend_pool_tvl() {
-    let env = ForkConfig::new(&mainnet_rpc()).build();
+    let env = ForkConfig::new(mainnet_rpc()).build().expect("fork setup");
     env.mock_all_auths();
 
     let usdc = addr(&env, USDC_SAC);
@@ -200,8 +202,9 @@ fn test_blend_pool_tvl() {
 /// Medium-Hard: derive the XLM/USDC price from Phoenix DEX pool reserves.
 /// AMM reserves = token balances held by the pool contract.
 #[test]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
 fn test_phoenix_xlm_price() {
-    let env = ForkConfig::new(&mainnet_rpc()).build();
+    let env = ForkConfig::new(mainnet_rpc()).build().expect("fork setup");
     env.mock_all_auths();
 
     let usdc = addr(&env, USDC_SAC);
@@ -242,8 +245,9 @@ fn test_phoenix_xlm_price() {
 /// Complex: survey the Stellar DeFi landscape in a single fork.
 /// One fork, multiple protocols, cross-contract balance queries.
 #[test]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
 fn test_defi_landscape() {
-    let env = ForkConfig::new(&mainnet_rpc()).build();
+    let env = ForkConfig::new(mainnet_rpc()).build().expect("fork setup");
     env.mock_all_auths();
 
     let usdc = addr(&env, USDC_SAC);

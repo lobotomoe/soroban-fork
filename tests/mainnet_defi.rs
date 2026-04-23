@@ -134,8 +134,9 @@ fn amm_output(reserve_in: i128, reserve_out: i128, amount_in: i128) -> i128 {
 /// The real USDC contract WASM is fetched from mainnet and executed locally.
 /// All state changes are local — no real tokens move.
 #[test]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
 fn test_token_lifecycle_on_fork() {
-    let env = ForkConfig::new(&mainnet_rpc()).build();
+    let env = ForkConfig::new(mainnet_rpc()).build().expect("fork setup");
     env.mock_all_auths();
 
     let usdc = addr(&env, USDC_SAC);
@@ -176,8 +177,9 @@ fn test_token_lifecycle_on_fork() {
 /// then withdraws. The pool's WASM is fetched from mainnet — the SAME code
 /// that runs in production. No mocks, no stubs.
 #[test]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
 fn test_blend_lending_roundtrip() {
-    let env = ForkConfig::new(&mainnet_rpc()).build();
+    let env = ForkConfig::new(mainnet_rpc()).build().expect("fork setup");
     env.mock_all_auths();
 
     let usdc = addr(&env, USDC_SAC);
@@ -257,8 +259,9 @@ fn test_blend_lending_roundtrip() {
 /// This test reads real Phoenix pool reserves and calculates swap outputs
 /// for different sizes, revealing the non-linear price impact curve.
 #[test]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
 fn test_swap_price_impact_real_vs_snapshot() {
-    let env = ForkConfig::new(&mainnet_rpc()).build();
+    let env = ForkConfig::new(mainnet_rpc()).build().expect("fork setup");
     env.mock_all_auths();
 
     let usdc = addr(&env, USDC_SAC);
@@ -365,8 +368,9 @@ fn test_swap_price_impact_real_vs_snapshot() {
 /// on a fork: pool utilization, interest rates, and available liquidity
 /// all come from REAL mainnet state.
 #[test]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
 fn test_cross_protocol_portfolio() {
-    let env = ForkConfig::new(&mainnet_rpc()).build();
+    let env = ForkConfig::new(mainnet_rpc()).build().expect("fork setup");
     env.mock_all_auths();
 
     let usdc = addr(&env, USDC_SAC);

@@ -1,12 +1,23 @@
 # soroban-fork
 
+[![crates.io](https://img.shields.io/crates/v/soroban-fork.svg)](https://crates.io/crates/soroban-fork)
+[![docs.rs](https://docs.rs/soroban-fork/badge.svg)](https://docs.rs/soroban-fork)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Lazy-loading mainnet/testnet fork for Soroban tests. Think [Foundry's Anvil](https://book.getfoundry.sh/anvil/), but for Stellar Soroban.
 
 When a test reads a ledger entry that isn't in the local cache, `soroban-fork` fetches it from the Soroban RPC on the fly. No need to pre-snapshot every contract your test might touch.
 
+## Install
+
+```toml
+[dev-dependencies]
+soroban-fork = "0.1"
+```
+
 ## Usage
 
-```rust
+```rust,no_run
 use soroban_fork::ForkConfig;
 use soroban_sdk::{Address, String, Symbol, vec};
 
@@ -14,7 +25,8 @@ use soroban_sdk::{Address, String, Symbol, vec};
 fn test_against_real_state() {
     let env = ForkConfig::new("https://soroban-testnet.stellar.org:443")
         .cache_file("test_cache.json")   // optional: persist for faster reruns
-        .build();
+        .build()
+        .expect("fork setup");
 
     env.mock_all_auths();
 
@@ -75,51 +87,82 @@ Your test calls contract.total_assets()
 
 ```rust
 ForkConfig::new(rpc_url)           // Soroban RPC endpoint
-    .cache_file("cache.json")      // optional: disk persistence + auto-save on drop
-    .network_id(bytes)             // optional: override network ID
-    .fetch_mode(FetchMode::Strict) // optional: Strict (default) or Lenient
-    .build()                       // returns ForkedEnv (derefs to Env)
+    .cache_file("cache.json")             // optional: disk persistence + auto-save on drop
+    .network_id(bytes)                    // optional: override the SHA-256 network id
+    .fetch_mode(FetchMode::Strict)        // optional: Strict (default) or Lenient
+    .at_ledger(1_234_567)                 // optional: pin the Env's reported sequence
+    .pinned_timestamp(1_700_000_000)      // optional: pin the Env's close time
+    .max_protocol_version(25)             // optional: cap the protocol the VM reports
+    .rpc_config(RpcConfig { retries: 5, ..RpcConfig::default() })
+    .build()?                             // returns Result<ForkedEnv, ForkError>
 ```
 
-Network ID is auto-detected from the URL (`testnet` or `mainnet` in the hostname).
+Network metadata (passphrase + SHA-256 id) is fetched from the RPC's
+`getNetwork` method at build time — no URL heuristics, no silent defaults.
+Override with `.network_id(bytes)` only if you actually need to.
 
 ### `ForkedEnv`
 
 Returned by `ForkConfig::build()`. Implements `Deref<Target = Env>` so all SDK
 methods work transparently. Adds fork-specific capabilities:
 
-```rust
-let env = ForkConfig::new(rpc_url).cache_file("cache.json").build();
+```rust,ignore
+let env = ForkConfig::new(rpc_url).cache_file("cache.json").build()?;
 
 // Use like a regular Env (via Deref)
 env.mock_all_auths();
 let result: i128 = env.invoke_contract(&addr, &symbol, vec![&env]);
 
 // Fork-specific methods
-env.fetch_count();    // number of RPC calls made
-env.save_cache()?;    // explicit save (also called automatically on drop)
-env.env();            // &Env reference (for edge cases where Deref doesn't suffice)
+env.fetch_count();                 // number of RPC calls made
+env.save_cache()?;                 // explicit save (also called automatically on drop)
+env.warp_time(86_400);             // advance ledger timestamp + sequence
+env.deal_token(&usdc, &who, amt);  // Foundry-style balance deal
+env.env();                         // &Env (for edge cases where Deref doesn't suffice)
 ```
 
 ### `FetchMode`
 
-Controls error handling on RPC failures:
+Controls behavior when the RPC fails from inside the VM loop (where the
+`SnapshotSource` trait can't return a typed error):
 
-- **`Strict`** (default): panics on RPC errors. Best for tests -- a fetch failure means the test setup is wrong.
-- **`Lenient`**: logs errors and returns `None`. Useful when partial state is acceptable.
+- **`Strict`** (default): panic. Best for tests — a fetch failure means the test setup is wrong, and you want the stack trace.
+- **`Lenient`**: log at `warn!` level and return `None`. Useful when partial state is acceptable.
+
+### `RpcConfig`
+
+Transport tunables. Defaults: 3 retries with 300 ms exponential backoff,
+30 s per-request timeout, 200-key batch size (Soroban RPC cap). Customize
+via `.rpc_config(RpcConfig { .. })` on the builder.
 
 ### `RpcSnapshotSource`
 
 The core primitive. Implements `soroban_env_host::storage::SnapshotSource`:
 
-```rust
-use soroban_fork::RpcSnapshotSource;
+```rust,ignore
+use std::sync::Arc;
+use soroban_fork::{RpcSnapshotSource, RpcConfig};
+use soroban_fork::RpcClient; // re-exported
 
-let source = RpcSnapshotSource::new("https://soroban-testnet.stellar.org:443".into());
-// Pre-load entries from a snapshot file
-source.preload(entries);
-// After testing, export all cached entries
-let all_entries = source.entries();
+let client = Arc::new(RpcClient::new("https://soroban-testnet.stellar.org:443", RpcConfig::default())?);
+let source = RpcSnapshotSource::new(client);
+source.preload(entries);          // pre-load entries from a snapshot file
+let all_entries = source.entries();  // export for persistence
+```
+
+### Errors
+
+Every public fallible API returns `Result<T, ForkError>`. The error enum
+discriminates transport failures, RPC-level errors, XDR codec failures,
+cache I/O, and protocol-violation cases — no string-typed errors.
+
+### Logging
+
+Uses the [`log`](https://docs.rs/log) facade — no output unless a logger
+is initialized in the test binary. Typical setup:
+
+```bash
+RUST_LOG=soroban_fork=info cargo test -- --ignored
 ```
 
 ## Combining with `stellar snapshot create`

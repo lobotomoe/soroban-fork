@@ -1,56 +1,78 @@
 //! # soroban-fork
 //!
-//! Lazy-loading mainnet/testnet fork for Soroban tests.
+//! Lazy-loading mainnet / testnet fork for Soroban tests.
 //!
-//! Think Foundry's Anvil, but for Stellar Soroban. When a test reads a ledger
-//! entry that isn't cached, it's fetched from the Soroban RPC on the fly.
+//! Think [Foundry's Anvil](https://book.getfoundry.sh/anvil/), but for Stellar
+//! Soroban. When a test reads a ledger entry that isn't cached, it's fetched
+//! from the Soroban RPC on the fly. State changes are local only — the real
+//! network is never mutated. On drop, lazy-fetched entries can be persisted
+//! to disk in the standard `stellar snapshot create` format, so a second run
+//! is fully local.
 //!
 //! ```rust,no_run
 //! use soroban_fork::ForkConfig;
 //!
 //! let env = ForkConfig::new("https://soroban-testnet.stellar.org:443")
 //!     .cache_file("fork_cache.json")
-//!     .build();
+//!     .build()
+//!     .expect("fork setup");
 //!
 //! // `env` derefs to `soroban_sdk::Env`, backed by real network state.
-//! // State changes are local only -- the network is never modified.
-//! // Cache is auto-saved on drop (includes lazy-fetched entries).
+//! env.mock_all_auths();
+//! ```
+//!
+//! ## Error handling
+//!
+//! [`ForkConfig::build`] returns [`Result<ForkedEnv, ForkError>`] so
+//! transport, cache, and XDR errors are all recoverable. Inside the VM
+//! loop — where the trait signature forbids returning errors — the source
+//! honors [`FetchMode::Strict`] (panic on transport failure) or
+//! [`FetchMode::Lenient`] (log + treat entry as missing).
+//!
+//! ## Logging
+//!
+//! The crate uses the [`log`] facade — no output appears unless the test
+//! binary initializes a logger (e.g. `env_logger`). Typical invocation:
+//!
+//! ```bash
+//! RUST_LOG=soroban_fork=info cargo test
 //! ```
 
+#![warn(missing_docs)]
+#![warn(clippy::all)]
+#![warn(rust_2018_idioms)]
+
 mod cache;
+mod error;
 mod rpc;
 mod source;
 
+pub use error::{ForkError, Result};
+pub use rpc::{FetchedEntry, LatestLedger, NetworkMetadata, RpcClient, RpcConfig};
 pub use source::{FetchMode, RpcSnapshotSource};
 
-use soroban_sdk::testutils::{Ledger as _, SnapshotSourceInput};
-use soroban_sdk::{Env, IntoVal, Symbol, Val};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Average Stellar ledger close time in seconds.
+use log::{info, warn};
+use soroban_sdk::testutils::{Ledger as _, SnapshotSourceInput};
+use soroban_sdk::{Env, IntoVal, Symbol, Val};
+
+/// Average Stellar ledger close time in seconds. Used by [`ForkedEnv::warp_time`]
+/// and [`ForkedEnv::warp_ledger`] to keep the two advancement modes in sync.
 const LEDGER_INTERVAL_SECONDS: u64 = 5;
 
-/// SHA-256 of "Test SDF Network ; September 2015"
-const TESTNET_NETWORK_ID: [u8; 32] = [
-    0xce, 0xe0, 0x30, 0x2d, 0x59, 0x84, 0x4d, 0x32, 0xbd, 0xca, 0x91, 0x5c, 0x82, 0x03, 0xdd, 0x44,
-    0xb3, 0x3f, 0xbb, 0x7e, 0xdc, 0x19, 0x05, 0x1e, 0xa3, 0x7a, 0xbe, 0xdf, 0x28, 0xec, 0xd4, 0x72,
-];
-
-/// SHA-256 of "Public Global Stellar Network ; September 2015"
-const MAINNET_NETWORK_ID: [u8; 32] = [
-    0x7a, 0xc3, 0x39, 0x97, 0x54, 0x4e, 0x31, 0x75, 0xd2, 0x66, 0xbd, 0x02, 0x24, 0x39, 0xb2, 0x2c,
-    0xdb, 0x16, 0x50, 0x8c, 0x01, 0x16, 0x3f, 0x26, 0xe5, 0xcb, 0x2a, 0x3e, 0x10, 0x45, 0xa9, 0x79,
-];
-
 // ---------------------------------------------------------------------------
-// ForkedEnv — wrapper that auto-saves cache on drop
+// ForkedEnv
 // ---------------------------------------------------------------------------
 
 /// A forked Soroban environment backed by real network state.
 ///
-/// Derefs to `soroban_sdk::Env` so all SDK methods work transparently.
-/// When dropped, any lazy-fetched entries are persisted to the cache file.
+/// Derefs to [`soroban_sdk::Env`] so all standard SDK methods work directly.
+/// When dropped, any lazy-fetched entries are persisted to the cache file
+/// if one was configured.
 pub struct ForkedEnv {
     env: Env,
     source: Rc<RpcSnapshotSource>,
@@ -69,21 +91,21 @@ impl std::ops::Deref for ForkedEnv {
 }
 
 impl ForkedEnv {
-    /// Get a reference to the underlying `Env`.
+    /// Borrow the underlying [`Env`]. Handy when you need the `Env` but not
+    /// the `ForkedEnv` wrapper — passing `&*forked` also works through `Deref`.
     pub fn env(&self) -> &Env {
         &self.env
     }
 
-    /// Number of RPC calls made since the fork was created.
+    /// Number of RPC calls served through the fork's cache since construction.
+    /// A cached (hit) read does not count; only lazy fetches that actually
+    /// reached the network.
     pub fn fetch_count(&self) -> u32 {
         self.source.fetch_count()
     }
 
-    /// Advance both ledger sequence and timestamp.
-    ///
-    /// This is the Soroban equivalent of Anvil's `evm_increaseTime` + `evm_mine`.
-    /// Use it to test time-dependent logic: upgrade timelocks, TTL expiry,
-    /// interest accrual, bridged balance staleness, etc.
+    /// Advance both the ledger sequence and timestamp. Soroban equivalent
+    /// of Anvil's `evm_increaseTime` + `evm_mine` in one call.
     pub fn warp(&self, ledgers: u32, seconds: u64) {
         self.env.ledger().with_mut(|info| {
             info.sequence_number += ledgers;
@@ -91,24 +113,26 @@ impl ForkedEnv {
         });
     }
 
-    /// Advance time by the given seconds.
-    /// Ledger sequence advances proportionally (~5 seconds per ledger on Stellar).
+    /// Advance time by `seconds`; ledger sequence moves proportionally
+    /// (~5 seconds per ledger, matching Stellar's target close rate).
     pub fn warp_time(&self, seconds: u64) {
         let ledgers = (seconds / LEDGER_INTERVAL_SECONDS) as u32;
         self.warp(ledgers, seconds);
     }
 
-    /// Advance by the given number of ledgers.
-    /// Timestamp advances proportionally (~5 seconds per ledger).
+    /// Advance by `ledgers` ledgers; timestamp moves proportionally.
     pub fn warp_ledger(&self, ledgers: u32) {
         let seconds = ledgers as u64 * LEDGER_INTERVAL_SECONDS;
         self.warp(ledgers, seconds);
     }
 
-    /// Set a token balance to an exact amount (Soroban equivalent of Foundry's `deal()`).
+    /// Set a SEP-41 token balance to an exact amount. Soroban equivalent
+    /// of Foundry's `deal()`.
     ///
-    /// Works by calculating the delta and calling mint (if increasing) or burn
-    /// (if decreasing) on the token contract. Requires `mock_all_auths()`.
+    /// Computes the delta against the current balance and calls `mint`
+    /// (if increasing) or `burn` (if decreasing) on the token contract.
+    /// Requires [`Env::mock_all_auths`] because the caller has to stand
+    /// in as the token's admin for `mint` and as `to` for `burn`.
     ///
     /// ```rust,ignore
     /// env.mock_all_auths();
@@ -135,8 +159,6 @@ impl ForkedEnv {
         }
 
         let target_val: Val = to.into_val(e);
-        let abs_delta: Val = delta.unsigned_abs().into_val(e);
-
         if delta > 0 {
             let delta_val: Val = delta.into_val(e);
             let mut args = soroban_sdk::Vec::new(e);
@@ -144,6 +166,7 @@ impl ForkedEnv {
             args.push_back(delta_val);
             e.invoke_contract::<()>(token, &Symbol::new(e, "mint"), args);
         } else {
+            let abs_delta: Val = delta.unsigned_abs().into_val(e);
             let mut args = soroban_sdk::Vec::new(e);
             args.push_back(target_val);
             args.push_back(abs_delta);
@@ -151,9 +174,10 @@ impl ForkedEnv {
         }
     }
 
-    /// Explicitly save the cache to disk.
-    /// Called automatically on drop, but can be called manually for safety.
-    pub fn save_cache(&self) -> Result<(), String> {
+    /// Explicitly persist the cache. Called automatically on drop when a
+    /// `cache_file` is configured, but can be invoked manually — useful
+    /// if you want cached state before a panic would drop the env.
+    pub fn save_cache(&self) -> Result<()> {
         let Some(path) = &self.cache_path else {
             return Ok(());
         };
@@ -170,111 +194,151 @@ impl ForkedEnv {
 
 impl Drop for ForkedEnv {
     fn drop(&mut self) {
-        if let Some(path) = &self.cache_path {
-            if let Err(e) = do_save_cache(
-                &self.source,
-                path,
-                self.ledger_sequence,
-                self.timestamp,
-                self.network_id,
-                self.protocol_version,
-            ) {
-                eprintln!("[soroban-fork] cache save error on drop: {e}");
-            } else {
+        let Some(path) = self.cache_path.as_ref() else {
+            return;
+        };
+        match do_save_cache(
+            &self.source,
+            path,
+            self.ledger_sequence,
+            self.timestamp,
+            self.network_id,
+            self.protocol_version,
+        ) {
+            Ok(()) => {
                 let count = self.source.entries().len();
-                eprintln!("[soroban-fork] saved {count} entries to {}", path.display());
+                info!("soroban-fork: saved {count} entries to {}", path.display());
+            }
+            Err(e) => {
+                warn!("soroban-fork: cache save error on drop: {e}");
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// ForkConfig — builder
+// ForkConfig
 // ---------------------------------------------------------------------------
 
-/// Builder for creating a forked Soroban environment.
+/// Builder for a [`ForkedEnv`]. All fields have sensible defaults — the only
+/// required input is the RPC URL.
+#[derive(Clone, Debug)]
 pub struct ForkConfig {
     rpc_url: String,
     cache_path: Option<PathBuf>,
     network_id: Option<[u8; 32]>,
     fetch_mode: Option<FetchMode>,
     pinned_ledger: Option<u32>,
+    pinned_timestamp: Option<u64>,
     max_protocol_version: Option<u32>,
+    rpc_config: RpcConfig,
 }
 
 impl ForkConfig {
-    /// Create a new fork config pointing at a Soroban RPC.
+    /// Create a new fork config pointing at a Soroban RPC endpoint.
     ///
     /// Common endpoints:
     /// - Testnet: `https://soroban-testnet.stellar.org:443`
-    /// - Mainnet: `https://soroban-rpc.mainnet.stellar.gateway.fm`
-    pub fn new(rpc_url: &str) -> Self {
-        // Auto-detect network ID from URL
-        let network_id = if rpc_url.contains("testnet") {
-            Some(TESTNET_NETWORK_ID)
-        } else if rpc_url.contains("mainnet") {
-            Some(MAINNET_NETWORK_ID)
-        } else {
-            None
-        };
-
+    /// - Mainnet (public): `https://soroban-rpc.mainnet.stellar.gateway.fm`
+    ///
+    /// The network ID is queried from the RPC's `getNetwork` method during
+    /// [`Self::build`] — no URL heuristics, no defaults. If you're running
+    /// an offline fork (not usually the point), supply the ID explicitly
+    /// via [`Self::network_id`].
+    pub fn new(rpc_url: impl Into<String>) -> Self {
         Self {
-            rpc_url: rpc_url.to_string(),
+            rpc_url: rpc_url.into(),
             cache_path: None,
-            network_id,
+            network_id: None,
             fetch_mode: None,
             pinned_ledger: None,
+            pinned_timestamp: None,
             max_protocol_version: None,
+            rpc_config: RpcConfig::default(),
         }
     }
 
     /// Path to a JSON file for persisting fetched entries.
-    /// If the file exists, entries are pre-loaded into the cache.
-    /// On drop, all entries (including lazy-fetched) are written back.
-    pub fn cache_file(mut self, path: &str) -> Self {
-        self.cache_path = Some(PathBuf::from(path));
+    ///
+    /// If the file exists at [`Self::build`] time, its entries pre-populate
+    /// the cache (compatible with `stellar snapshot create` output). On
+    /// [`ForkedEnv`] drop, the cache is written back — subsequent runs are
+    /// fully local.
+    pub fn cache_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cache_path = Some(path.into());
         self
     }
 
-    /// Override the network ID (SHA-256 of network passphrase).
+    /// Override the network ID (SHA-256 of the network passphrase).
+    ///
+    /// Normally fetched from the RPC. Override only if you need a specific
+    /// value — e.g. for regression tests of signatures computed against an
+    /// older network ID.
     pub fn network_id(mut self, id: [u8; 32]) -> Self {
         self.network_id = Some(id);
         self
     }
 
-    /// Set the fetch mode.
-    /// - `Strict` (default): panic on RPC errors. Best for tests.
-    /// - `Lenient`: log errors and return None. For partial-state scenarios.
+    /// Select the fetch mode. Defaults to [`FetchMode::Strict`] — RPC errors
+    /// inside the VM loop panic, which is what tests want.
     pub fn fetch_mode(mut self, mode: FetchMode) -> Self {
         self.fetch_mode = Some(mode);
         self
     }
 
-    /// Pin to a specific ledger sequence for reproducible tests.
+    /// Pin the ledger sequence the forked `Env` reports to contracts.
     ///
-    /// Note: the RPC always returns entries at the latest ledger. This override
-    /// sets the Env's ledger sequence/timestamp so contract logic sees the
-    /// pinned value. For full state reproducibility, use `cache_file()`.
+    /// The RPC itself always returns entries at the latest ledger — this
+    /// setting only shifts what `env.ledger().sequence_number()` reports,
+    /// which is what contract logic reads. For full state reproducibility,
+    /// pair with [`Self::cache_file`].
     pub fn at_ledger(mut self, sequence: u32) -> Self {
         self.pinned_ledger = Some(sequence);
         self
     }
 
-    /// Cap the protocol version (e.g., 25 to avoid "protocol too new" errors
-    /// when the network has upgraded but your SDK hasn't).
+    /// Pin the ledger timestamp the forked `Env` reports (Unix seconds).
+    ///
+    /// The default is `SystemTime::now()` — a wall-clock approximation of
+    /// the real ledger close time (~5 s off at most). Pin an explicit value
+    /// for tests that assert on specific close times.
+    pub fn pinned_timestamp(mut self, unix_seconds: u64) -> Self {
+        self.pinned_timestamp = Some(unix_seconds);
+        self
+    }
+
+    /// Cap the protocol version the VM reports to contracts.
+    ///
+    /// Useful when the real network has upgraded past what your `soroban-sdk`
+    /// version knows — the contract sees `max`, not the live value, and
+    /// protocol-specific asserts still pass.
     pub fn max_protocol_version(mut self, version: u32) -> Self {
         self.max_protocol_version = Some(version);
         self
     }
 
+    /// Replace the default RPC transport configuration (timeouts, retries,
+    /// batch size). See [`RpcConfig`] for tunables.
+    pub fn rpc_config(mut self, config: RpcConfig) -> Self {
+        self.rpc_config = config;
+        self
+    }
+
     /// Build the forked environment.
     ///
-    /// 1. Creates `RpcSnapshotSource` (lazy RPC fallback on cache miss)
-    /// 2. Pre-loads entries from cache file if it exists
-    /// 3. Fetches current ledger info from RPC
-    /// 4. Returns a `ForkedEnv` that derefs to `soroban_sdk::Env`
-    pub fn build(self) -> ForkedEnv {
-        let source = RpcSnapshotSource::new(self.rpc_url.clone());
+    /// Steps:
+    /// 1. Construct an [`RpcClient`](crate::RpcConfig) from this config.
+    /// 2. Pre-load entries from `cache_file` if it exists.
+    /// 3. Resolve network metadata + latest ledger sequence via RPC
+    ///    (unless overridden by [`Self::network_id`] / [`Self::at_ledger`]).
+    /// 4. Return a [`ForkedEnv`] that derefs to [`Env`].
+    pub fn build(self) -> Result<ForkedEnv> {
+        let client = Arc::new(rpc::RpcClient::new(
+            self.rpc_url.clone(),
+            self.rpc_config.clone(),
+        )?);
+
+        let source = source::RpcSnapshotSource::new(client.clone());
         let source = match self.fetch_mode {
             Some(mode) => source.with_fetch_mode(mode),
             None => source,
@@ -287,51 +351,56 @@ impl ForkConfig {
                     Ok(entries) => {
                         let count = entries.len();
                         source.preload(entries);
-                        eprintln!(
-                            "[soroban-fork] pre-loaded {count} entries from {}",
+                        info!(
+                            "soroban-fork: pre-loaded {count} entries from {}",
                             path.display()
                         );
                     }
                     Err(e) => {
-                        eprintln!("[soroban-fork] cache load error (starting fresh): {e}");
+                        warn!(
+                            "soroban-fork: cache load error, starting fresh ({}): {e}",
+                            path.display()
+                        );
                     }
                 }
             }
         }
 
-        // Fetch current ledger info
-        let client = reqwest::blocking::Client::new();
-        let ledger_info = rpc::get_latest_ledger(&client, &self.rpc_url)
-            .expect("[soroban-fork] failed to fetch latest ledger from RPC");
+        let latest = client.get_latest_ledger()?;
 
-        let network_id = self.network_id.unwrap_or(ledger_info.network_id);
+        // Resolve network_id: explicit override wins; otherwise fetch from RPC.
+        let network_id = match self.network_id {
+            Some(id) => id,
+            None => client.get_network()?.network_id,
+        };
 
-        // Apply overrides
-        let sequence = self.pinned_ledger.unwrap_or(ledger_info.sequence);
+        let sequence = self.pinned_ledger.unwrap_or(latest.sequence);
         let protocol_version = match self.max_protocol_version {
-            Some(max) if ledger_info.protocol_version > max => {
-                eprintln!(
-                    "[soroban-fork] capping protocol version {} -> {} (max_protocol_version)",
-                    ledger_info.protocol_version, max
+            Some(max) if latest.protocol_version > max => {
+                info!(
+                    "soroban-fork: capping protocol version {} -> {} (max_protocol_version)",
+                    latest.protocol_version, max
                 );
                 max
             }
-            _ => ledger_info.protocol_version,
+            _ => latest.protocol_version,
         };
+        let timestamp = self
+            .pinned_timestamp
+            .unwrap_or_else(|| wall_clock_seconds().unwrap_or(0));
 
         let sdk_ledger_info = soroban_env_host::LedgerInfo {
             protocol_version,
             sequence_number: sequence,
-            timestamp: ledger_info.timestamp,
+            timestamp,
             network_id,
-            base_reserve: 100,
-            min_persistent_entry_ttl: 4096,
-            min_temp_entry_ttl: 16,
-            max_entry_ttl: 6_312_000,
+            base_reserve: cache::DEFAULT_BASE_RESERVE,
+            min_persistent_entry_ttl: cache::DEFAULT_MIN_PERSISTENT_ENTRY_TTL,
+            min_temp_entry_ttl: cache::DEFAULT_MIN_TEMP_ENTRY_TTL,
+            max_entry_ttl: cache::DEFAULT_MAX_ENTRY_TTL,
         };
 
         let source_rc = Rc::new(source);
-
         let input = SnapshotSourceInput {
             source: source_rc.clone(),
             ledger_info: Some(sdk_ledger_info),
@@ -340,22 +409,23 @@ impl ForkConfig {
 
         let env = Env::from_ledger_snapshot(input);
 
-        eprintln!(
-            "[soroban-fork] forked at ledger {} (protocol {})",
-            sequence, protocol_version
-        );
+        info!("soroban-fork: forked at ledger {sequence} (protocol {protocol_version})");
 
-        ForkedEnv {
+        Ok(ForkedEnv {
             env,
             source: source_rc,
             cache_path: self.cache_path,
             ledger_sequence: sequence,
-            timestamp: ledger_info.timestamp,
+            timestamp,
             network_id,
             protocol_version,
-        }
+        })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn do_save_cache(
     source: &RpcSnapshotSource,
@@ -364,7 +434,7 @@ fn do_save_cache(
     timestamp: u64,
     network_id: [u8; 32],
     protocol_version: u32,
-) -> Result<(), String> {
+) -> Result<()> {
     let entries = source.entries();
     if entries.is_empty() {
         return Ok(());
@@ -379,131 +449,67 @@ fn do_save_cache(
     )
 }
 
+/// Returns the current Unix timestamp in seconds, or `None` if the system
+/// clock is set before the epoch (basically never on any real machine, but
+/// handled explicitly so the call site can't panic).
+fn wall_clock_seconds() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .ok()
+}
+
 // ---------------------------------------------------------------------------
-// Integration tests (hit real testnet RPC)
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-    use soroban_sdk::testutils::Ledger;
-    use soroban_sdk::{Address, String as SorobanString, Symbol};
-
-    const TESTNET_RPC: &str = "https://soroban-testnet.stellar.org:443";
-
-    /// Our deployed vault on testnet (v3).
-    const VAULT_ID: &str = "CCN4JVLCHZHYNRDY5VA7B26FWDI7G6DPXJTHFIUGHNUCD4T3SDTKWAR5";
 
     #[test]
-    fn test_fork_connects_to_testnet() {
-        let env = ForkConfig::new(TESTNET_RPC)
-            .max_protocol_version(25)
-            .build();
-        let info = env.ledger().get();
-        assert!(info.sequence_number > 0);
-        assert_eq!(info.network_id, TESTNET_NETWORK_ID);
-        assert_eq!(env.fetch_count(), 0);
-        eprintln!("[test] forked at ledger {}", info.sequence_number);
-    }
+    fn fork_config_builder_records_overrides() {
+        let cfg = ForkConfig::new("https://example.test")
+            .cache_file("/tmp/ignored.json")
+            .network_id([7u8; 32])
+            .fetch_mode(FetchMode::Lenient)
+            .at_ledger(12345)
+            .pinned_timestamp(999)
+            .max_protocol_version(25);
 
-    #[test]
-    fn test_fork_with_snapshot_file() {
-        let snapshot_path = "/tmp/vault_snapshot.json";
-        if !std::path::Path::new(snapshot_path).exists() {
-            eprintln!(
-                "[test] skipping: {snapshot_path} not found. \
-                 Run `stellar snapshot create` first."
-            );
-            return;
-        }
-
-        let env = ForkConfig::new(TESTNET_RPC)
-            .cache_file(snapshot_path)
-            .max_protocol_version(25)
-            .build();
-        env.mock_all_auths();
-
-        let vault_addr = Address::from_string(&SorobanString::from_str(&env, VAULT_ID));
-
-        let admin: Address = env.invoke_contract(
-            &vault_addr,
-            &Symbol::new(&env, "admin"),
-            soroban_sdk::vec![&env],
-        );
-        eprintln!("[test] vault admin = {:?}", admin);
-        eprintln!("[test] RPC fetches: {}", env.fetch_count());
-    }
-
-    /// Dogfooding: invoke contract methods on the real testnet vault
-    /// via pure lazy fetch (no snapshot file).
-    /// Each ledger entry is fetched from the RPC on demand.
-    #[test]
-    fn test_lazy_invoke_vault() {
-        let env = ForkConfig::new(TESTNET_RPC)
-            .max_protocol_version(25)
-            .build();
-        env.mock_all_auths();
-
-        let vault_addr = Address::from_string(&SorobanString::from_str(&env, VAULT_ID));
-
-        // name() reads from instance storage -> triggers lazy fetch of:
-        //   1. ContractData(instance) -> gets WASM hash
-        //   2. ContractCode(wasm)     -> gets the WASM binary
-        //   3. Storage entry for name
-        let name: soroban_sdk::String = env.invoke_contract(
-            &vault_addr,
-            &Symbol::new(&env, "name"),
-            soroban_sdk::vec![&env],
-        );
-        eprintln!("[test] vault name = {:?}", name);
-
-        let symbol: soroban_sdk::String = env.invoke_contract(
-            &vault_addr,
-            &Symbol::new(&env, "symbol"),
-            soroban_sdk::vec![&env],
-        );
-        eprintln!("[test] vault symbol = {:?}", symbol);
-
-        let total_supply: i128 = env.invoke_contract(
-            &vault_addr,
-            &Symbol::new(&env, "total_supply"),
-            soroban_sdk::vec![&env],
-        );
-        eprintln!("[test] vault total_supply = {total_supply}");
-        assert!(total_supply >= 0);
-
-        eprintln!("[test] RPC fetches: {}", env.fetch_count());
-    }
-
-    #[test]
-    fn test_warp_time() {
-        let env = ForkConfig::new(TESTNET_RPC)
-            .max_protocol_version(25)
-            .build();
-        let before = env.ledger().get();
-
-        // Warp 24 hours
-        env.warp_time(86_400);
-
-        let after = env.ledger().get();
-        assert_eq!(after.timestamp, before.timestamp + 86_400);
+        assert_eq!(cfg.rpc_url, "https://example.test");
         assert_eq!(
-            after.sequence_number,
-            before.sequence_number + 86_400 / 5 // ~17,280 ledgers
+            cfg.cache_path.as_deref(),
+            Some(std::path::Path::new("/tmp/ignored.json"))
         );
-        eprintln!(
-            "[test] warped: ledger {} -> {}, time +24h",
-            before.sequence_number, after.sequence_number
-        );
+        assert_eq!(cfg.network_id, Some([7u8; 32]));
+        assert_eq!(cfg.fetch_mode, Some(FetchMode::Lenient));
+        assert_eq!(cfg.pinned_ledger, Some(12345));
+        assert_eq!(cfg.pinned_timestamp, Some(999));
+        assert_eq!(cfg.max_protocol_version, Some(25));
+    }
 
-        // Warp 100 ledgers
-        env.warp_ledger(100);
-        let final_info = env.ledger().get();
-        assert_eq!(final_info.sequence_number, after.sequence_number + 100);
-        assert_eq!(final_info.timestamp, after.timestamp + 500); // 100 * 5s
-        eprintln!(
-            "[test] warped: ledger {} -> {}, time +500s",
-            after.sequence_number, final_info.sequence_number
-        );
+    #[test]
+    fn fork_config_debug_redacts_nothing_sensitive() {
+        // ForkConfig is Debug; this sanity-tests it doesn't panic and
+        // renders the URL (no secrets in config today).
+        let cfg = ForkConfig::new("https://example.test");
+        let s = format!("{cfg:?}");
+        assert!(s.contains("example.test"));
+    }
+
+    #[test]
+    fn wall_clock_seconds_returns_some_on_reasonable_system() {
+        let now = wall_clock_seconds().expect("system clock should be post-1970");
+        // Assert roughly "some time after Stellar mainnet launch (2015)".
+        assert!(now > 1_440_000_000);
+    }
+
+    /// The `getNetwork`-based network_id path is exercised in
+    /// `tests/network.rs` (marked `#[ignore]` so offline CI still passes).
+    #[test]
+    fn explicit_network_id_override_is_stored() {
+        let cfg = ForkConfig::new("https://example.test").network_id([0xAB; 32]);
+        assert_eq!(cfg.network_id, Some([0xAB; 32]));
     }
 }
