@@ -1028,6 +1028,181 @@ fn parse_trustline_balance(item: &Value) -> i64 {
     }
 }
 
+/// `anvil_setLedgerEntry` writes an arbitrary `LedgerEntry` directly
+/// into the snapshot source. Round-trip verifies that:
+/// 1. The wire decode + worker dispatch + cache write actually happen.
+/// 2. The next `getLedgerEntries` for that key returns what we wrote.
+///
+/// Demonstrates the load-bearing primitive Anvil's `setStorageAt` /
+/// `setBalance` cheatcodes are built on. We use a `ContractData`
+/// entry so the test stresses the most common stress-test case
+/// (oracle / contract-storage manipulation).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
+async fn server_anvil_set_ledger_entry_round_trips() {
+    use soroban_env_host::xdr::{ContractDataEntry, LedgerEntryData, LedgerEntryExt};
+
+    let (url, running) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Pick a ContractData key on the XLM SAC that doesn't exist on
+    // mainnet — `Symbol("forktest")` as the inner key. Reading the
+    // key first should miss; after we write, reading should hit
+    // with our exact value.
+    let xlm_id = decode_contract_id(XLM_SAC);
+    let probe_key_scval = ScVal::Symbol(ScSymbol("forktest".try_into().unwrap()));
+    let key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: ScAddress::Contract(ContractId(Hash(xlm_id))),
+        key: probe_key_scval.clone(),
+        durability: ContractDataDurability::Persistent,
+    });
+    let key_b64 = BASE64.encode(key.to_xdr(Limits::none()).unwrap());
+
+    // Pre-condition: entry is absent.
+    let pre = jsonrpc_call(
+        &client,
+        &url,
+        "getLedgerEntries",
+        serde_json::json!({ "keys": [key_b64.clone()] }),
+    )
+    .await;
+    assert!(
+        pre["result"]["entries"].as_array().unwrap().is_empty(),
+        "probe key should not exist on mainnet before our write"
+    );
+
+    // Build the entry we want to write: ContractData with an
+    // `i128(42_424_242)` value. Anvil-style raw write — we don't
+    // care that the host wouldn't normally produce this entry.
+    let target_value = ScVal::I128(soroban_env_host::xdr::Int128Parts {
+        hi: 0,
+        lo: 42_424_242,
+    });
+    let entry = soroban_env_host::xdr::LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::ContractData(ContractDataEntry {
+            ext: soroban_env_host::xdr::ExtensionPoint::V0,
+            contract: ScAddress::Contract(ContractId(Hash(xlm_id))),
+            key: probe_key_scval,
+            durability: ContractDataDurability::Persistent,
+            val: target_value.clone(),
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+    let entry_b64 = BASE64.encode(entry.to_xdr(Limits::none()).unwrap());
+
+    // Cheatcode write.
+    let set_resp = jsonrpc_call(
+        &client,
+        &url,
+        "anvil_setLedgerEntry",
+        serde_json::json!({
+            "key": key_b64,
+            "entry": entry_b64,
+            "liveUntilLedgerSeq": 999_999_999u32,
+        }),
+    )
+    .await;
+    assert_eq!(set_resp["result"]["ok"], true);
+    assert!(set_resp["result"]["latestLedger"].as_u64().unwrap() > 0);
+
+    // Post-condition: same getLedgerEntries call now returns our
+    // entry verbatim.
+    let post = jsonrpc_call(
+        &client,
+        &url,
+        "getLedgerEntries",
+        serde_json::json!({ "keys": [key_b64] }),
+    )
+    .await;
+    let entries = post["result"]["entries"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "the cheatcode-written entry must be visible"
+    );
+
+    // Decode the returned entry's value and confirm exact match.
+    let returned_xdr_b64 = entries[0]["xdr"].as_str().unwrap();
+    let returned_bytes = BASE64.decode(returned_xdr_b64).unwrap();
+    let returned_data = LedgerEntryData::from_xdr(returned_bytes, Limits::none()).expect("decode");
+    let returned_val = match returned_data {
+        LedgerEntryData::ContractData(cd) => cd.val,
+        other => panic!("expected ContractData, got {other:?}"),
+    };
+    assert_eq!(
+        returned_val, target_value,
+        "the value we wrote must round-trip verbatim"
+    );
+
+    running.shutdown().await.expect("shutdown");
+}
+
+/// `anvil_mine` advances the fork's reported ledger sequence and
+/// close-time. After mining, `getLatestLedger` reflects the new
+/// values — proving that time-sensitive contract logic (vesting,
+/// oracle staleness) can be pushed past thresholds without
+/// sending real transactions.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
+async fn server_anvil_mine_advances_ledger() {
+    let (url, running) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let before = jsonrpc_call(&client, &url, "getLatestLedger", Value::Null).await;
+    let before_seq = before["result"]["sequence"].as_u64().expect("sequence") as u32;
+
+    // Mine 100 blocks with default 5s/block timestamp advance.
+    let mine_resp = jsonrpc_call(
+        &client,
+        &url,
+        "anvil_mine",
+        serde_json::json!({ "blocks": 100u32 }),
+    )
+    .await;
+    let new_seq: u32 = mine_resp["result"]["newSequence"]
+        .as_u64()
+        .expect("newSequence") as u32;
+    let new_close_time: u64 = mine_resp["result"]["newCloseTime"]
+        .as_str()
+        .expect("newCloseTime is string")
+        .parse()
+        .expect("parses as u64");
+
+    assert_eq!(
+        new_seq,
+        before_seq + 100,
+        "mine should advance the ledger by exactly the requested block count"
+    );
+    assert!(
+        new_close_time > 0,
+        "close time must be present and non-zero"
+    );
+
+    // Confirm the next getLatestLedger sees the bump (i.e. mine
+    // wasn't a phantom — the env's live ledger info was actually
+    // updated, not just the response synthesised).
+    let after = jsonrpc_call(&client, &url, "getLatestLedger", Value::Null).await;
+    let after_seq = after["result"]["sequence"].as_u64().expect("sequence") as u32;
+    assert_eq!(
+        after_seq, new_seq,
+        "subsequent getLatestLedger must agree with anvil_mine's reported new_sequence"
+    );
+
+    // Mine with no params (default: 1 block, +5s) should advance by 1.
+    let one_more = jsonrpc_call(&client, &url, "anvil_mine", Value::Null).await;
+    let after_one_more: u32 = one_more["result"]["newSequence"]
+        .as_u64()
+        .expect("newSequence") as u32;
+    assert_eq!(
+        after_one_more,
+        new_seq + 1,
+        "no-arg anvil_mine should default to 1 block"
+    );
+
+    running.shutdown().await.expect("shutdown");
+}
+
 // `dummy_source_account` is referenced from a docstring example only;
 // silence the unused-but-needed-as-sample warning.
 #[allow(dead_code)]

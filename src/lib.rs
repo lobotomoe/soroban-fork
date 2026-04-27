@@ -147,9 +147,18 @@ impl ForkedEnv {
     /// positives (the entry stays "live" past its real-mainnet expiry).
     /// Tracking issue: <https://github.com/lobotomoe/soroban-fork/issues>.
     pub fn warp(&self, ledgers: u32, seconds: u64) {
+        // Saturating arithmetic: pre-v0.8 these `+=` ops were
+        // reachable only from lib-mode test code, where an overflow
+        // panic was a fine signal of "your test math is wrong". v0.8
+        // wires `warp` through `anvil_mine` over JSON-RPC, so any
+        // client can request unbounded advances; saturating keeps
+        // wire-driven misuse from panicking the worker thread (which
+        // would kill the whole server). The saturated values are
+        // already past any meaningful real-Stellar ledger horizon, so
+        // tests reaching them are intentionally pathological anyway.
         self.env.ledger().with_mut(|info| {
-            info.sequence_number += ledgers;
-            info.timestamp += seconds;
+            info.sequence_number = info.sequence_number.saturating_add(ledgers);
+            info.timestamp = info.timestamp.saturating_add(seconds);
         });
     }
 
@@ -233,18 +242,27 @@ impl ForkedEnv {
         self.protocol_version
     }
 
-    /// Ledger sequence reported by the forked Env. Equal to the upstream
-    /// RPC's latest at fork-build time, or whatever was passed to
-    /// [`ForkConfig::at_ledger`].
+    /// Ledger sequence the forked Env *currently* reports — reads
+    /// the live value out of [`Env::ledger`] so any [`Self::warp`] /
+    /// [`Self::warp_ledger`] / `anvil_mine` calls are reflected
+    /// immediately. At fork build the value matches the upstream
+    /// RPC's latest (or [`ForkConfig::at_ledger`]); cheatcodes that
+    /// advance time move it forward from there.
+    ///
+    /// The fork-point sequence (used as cache metadata in
+    /// [`Self::save_cache`]) is preserved separately on the
+    /// `ledger_sequence` field so cache provenance stays accurate
+    /// even after the env has been warped.
     pub fn ledger_sequence(&self) -> u32 {
-        self.ledger_sequence
+        self.env.ledger().get().sequence_number
     }
 
-    /// Close-time the forked Env reports (Unix seconds). Equal to the
-    /// upstream RPC's `getLedgers` close time at fork-build time, or
-    /// whatever was passed to [`ForkConfig::pinned_timestamp`].
+    /// Close-time the forked Env *currently* reports (Unix seconds).
+    /// Live reading from [`Env::ledger`] — `anvil_mine` and
+    /// [`Self::warp_time`] move it; the fork-point timestamp is
+    /// preserved separately for cache provenance.
     pub fn ledger_close_time(&self) -> u64 {
-        self.timestamp
+        self.env.ledger().get().timestamp
     }
 
     /// Direct access to the snapshot source. Useful when the JSON-RPC

@@ -377,6 +377,55 @@ pub(crate) struct GetTransactionParams {
     pub(crate) hash: String,
 }
 
+// ---------------------------------------------------------------------------
+// anvil_* cheatcodes
+// ---------------------------------------------------------------------------
+
+/// `anvil_setLedgerEntry` request: a base64-XDR `LedgerKey` and the
+/// matching `LedgerEntry` to install in the snapshot source.
+///
+/// `liveUntilLedgerSeq` is optional — used for entries that carry a
+/// TTL (`ContractData`, `ContractCode`); ignored otherwise.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetLedgerEntryParams {
+    pub(crate) key: String,
+    pub(crate) entry: String,
+    #[serde(default)]
+    pub(crate) live_until_ledger_seq: Option<u32>,
+}
+
+/// `anvil_setLedgerEntry` response — just an ack with the latest
+/// ledger so clients can sanity-check what they wrote against.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetLedgerEntryResponse {
+    pub(crate) ok: bool,
+    pub(crate) latest_ledger: u32,
+}
+
+/// `anvil_mine` request: how many ledgers to advance, and how much
+/// to bump close-time. Both default to "one ledger, +5s" — Stellar's
+/// average close rate, so the fork's reported time stays plausible
+/// without ceremony.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MineParams {
+    #[serde(default)]
+    pub(crate) blocks: Option<u32>,
+    #[serde(default)]
+    pub(crate) timestamp_advance_seconds: Option<u64>,
+}
+
+/// `anvil_mine` response — echoes the new ledger seq + close-time
+/// so callers don't need a follow-up `getLatestLedger`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MineResponse {
+    pub(crate) new_sequence: u32,
+    pub(crate) new_close_time: String,
+}
+
 /// `getTransaction` response — receipt for a previously-applied tx.
 ///
 /// Field set is a deliberate subset of Stellar's wire shape: we

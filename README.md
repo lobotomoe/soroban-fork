@@ -263,7 +263,7 @@ Soroswap, etc.) follow the same pattern: dependencies the deployed
 contract reaches into get lazy-fetched from mainnet and cached
 locally.
 
-### Methods supported in v0.7
+### Methods supported in v0.8
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -299,25 +299,39 @@ locally.
   Returns `"SUCCESS"` / `"FAILED"` / `"NOT_FOUND"`, plus the original
   envelope, the host function's `ScVal` return value, and the
   applied-changes count when found.
+- **`anvil_setLedgerEntry`** *(new in v0.8)* — Anvil-style cheatcode:
+  force-write a base64-XDR `LedgerEntry` to any `LedgerKey` directly
+  in the snapshot source, bypassing host-level checks. Load-bearing
+  primitive for stress-test scenarios — oracle price manipulation,
+  force-set token balances, replace contract code, all reduce to
+  this one entry write.
+- **`anvil_mine`** *(new in v0.8)* — advance the fork's reported
+  ledger sequence by `blocks` (default 1) and bump close-time by
+  `timestampAdvanceSeconds` (default `blocks * 5` — Stellar's
+  average close rate). Pushes time-sensitive contract logic
+  (vesting cliffs, oracle staleness) past thresholds without
+  orchestrating real transactions.
 
-### What v0.7 server does NOT support
+### What v0.8 server does NOT support
 
 Listed up front so nothing surprises you:
 
 - **`getEvents`** — historical event filtering. Diagnostic events
   emitted during simulation are reachable via `simulateTransaction`'s
   response.
-- **`anvil_*` cheatcodes** — `setBalance`, `setStorage`, `setCode`,
-  `impersonate`. Scoped to v0.8 alongside the cheatcode primitives.
+- **Ergonomic `anvil_*` wrappers** — `setBalance`, `setStorage`,
+  `setCode`, `setNonce`, `impersonate`. The primitive
+  `anvil_setLedgerEntry` covers all of these once the client
+  constructs the right XDR; sugar wrappers are a v0.8.x followup.
 - **`anvil_snapshot` / `anvil_revert`** — saved-state checkpoints.
   Scoped to v0.9 (the `Rc<HostImpl>` snapshot model needs its own
-  design pass).
-- **`sendTransaction` ledger advancement** — each successful send
-  applies its writes and bumps the source's `seq_num`, but does not
-  yet bump `env.ledger().sequence_number()`. Time-sensitive contract
-  logic (vesting, oracle staleness checks) sees the same ledger
-  across multiple sends until you call `env.warp(...)` from lib mode.
-  Block-by-side-effect is a v0.7.x followup.
+  design pass — either a journaling layer over `RpcSnapshotSource`
+  or a clone-on-snapshot of the entire cache map).
+- **Block production by `sendTransaction` side-effect** — each send
+  applies its writes and bumps the source's `seq_num`, but does
+  *not* automatically advance `env.ledger().sequence_number()`. Use
+  `anvil_mine` (or `env.warp(...)` from lib mode) to push the
+  ledger forward. Auto-mine on send is a v0.8.x ergonomic followup.
 - **`resultMetaXdr` on `getTransaction`** — Stellar's
   `TransactionMeta::V3` carries state-change deltas in a
   Stellar-core-XDR-heavy shape; v0.6 returns `returnValueXdr` and

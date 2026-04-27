@@ -115,6 +115,31 @@ pub(crate) enum Command {
         source_account: AccountId,
         reply: oneshot::Sender<SendReply>,
     },
+    /// Anvil-style cheatcode: force-write a `LedgerEntry` directly
+    /// into the snapshot source, bypassing any host-level checks.
+    /// The load-bearing primitive for stress-testing scenarios —
+    /// oracle price manipulation, force-set token balances, replace
+    /// contract code, all reduce to one entry write.
+    ///
+    /// `live_until` carries an optional TTL hint for entries that
+    /// have one (`ContractData`, `ContractCode`); pass `None` for
+    /// entries that don't (`Account`, `Trustline`).
+    SetLedgerEntry {
+        key: LedgerKey,
+        entry: LedgerEntry,
+        live_until: Option<u32>,
+        reply: oneshot::Sender<()>,
+    },
+    /// Anvil-style `mine`: advance the fork's reported ledger
+    /// sequence by `blocks` and the close-time by
+    /// `timestamp_advance_seconds`. Used to push past
+    /// vesting-cliff / oracle-staleness thresholds without
+    /// orchestrating a real block flow.
+    Mine {
+        blocks: u32,
+        timestamp_advance_seconds: u64,
+        reply: oneshot::Sender<MineReply>,
+    },
     /// Look up a previously-applied transaction's receipt by hash.
     /// Hash is the 32-byte SHA-256 of the original envelope bytes.
     GetTransaction {
@@ -235,6 +260,15 @@ pub(crate) struct TxReceipt {
 pub(crate) struct SendReply {
     pub(crate) hash: [u8; 32],
     pub(crate) receipt: TxReceipt,
+}
+
+/// Reply for `Command::Mine` — new ledger sequence + close-time so
+/// the wire response can confirm the bump without a follow-up
+/// `getLatestLedger` round-trip.
+#[derive(Debug)]
+pub(crate) struct MineReply {
+    pub(crate) new_sequence: u32,
+    pub(crate) new_close_time: u64,
 }
 
 /// Handle to the worker thread. Cloning is cheap (Arc-style internally
@@ -400,6 +434,30 @@ fn worker_loop(env: crate::ForkedEnv, mut rx: mpsc::Receiver<Command>) {
             }
             Command::GetTransaction { hash, reply } => {
                 let _ = reply.send(receipts.get(&hash).cloned());
+            }
+            Command::SetLedgerEntry {
+                key,
+                entry,
+                live_until,
+                reply,
+            } => {
+                env.snapshot_source().set_entry(key, entry, live_until);
+                let _ = reply.send(());
+            }
+            Command::Mine {
+                blocks,
+                timestamp_advance_seconds,
+                reply,
+            } => {
+                // `warp` mutates the SDK's live LedgerInfo; our
+                // `ledger_sequence()` / `ledger_close_time()`
+                // accessors read straight from there, so subsequent
+                // `getLatestLedger` calls reflect the new values.
+                env.warp(blocks, timestamp_advance_seconds);
+                let _ = reply.send(MineReply {
+                    new_sequence: env.ledger_sequence(),
+                    new_close_time: env.ledger_close_time(),
+                });
             }
         }
     }

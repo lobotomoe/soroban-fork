@@ -125,6 +125,30 @@ impl RpcSnapshotSource {
         self.fetch_count.load(Ordering::Relaxed)
     }
 
+    /// Force-write a single `LedgerEntry` into the cache, replacing
+    /// whatever was there (or creating a fresh entry if the key was
+    /// absent). Powers the JSON-RPC `anvil_setLedgerEntry` cheatcode
+    /// — clients hand us an XDR-encoded entry, we trust them and
+    /// install it. Subsequent reads (including via the host's
+    /// recording-mode storage in `simulateTransaction` /
+    /// `sendTransaction`) see the new entry.
+    ///
+    /// This is the load-bearing primitive for Anvil-style stress
+    /// testing: any state mutation Anvil's `setStorageAt` /
+    /// `setBalance` / `setCode` cheatcodes do is just an entry
+    /// write, and Stellar's storage model maps cleanly to one
+    /// LedgerEntry-per-key. Higher-level wrappers (`setBalance`,
+    /// `setCode`, etc.) compose on top.
+    ///
+    /// `live_until` carries forward an optional TTL hint — pass
+    /// `None` for entries that don't have one (Account, Trustline)
+    /// or when the test doesn't care about expiry.
+    pub fn set_entry(&self, key: LedgerKey, entry: LedgerEntry, live_until: Option<u32>) {
+        let bytes = encode_entry(&entry);
+        let mut cache = self.cache.lock().expect("cache mutex poisoned");
+        cache.insert(key, Some((bytes, live_until)));
+    }
+
     /// Bump the `seq_num` of an Account ledger entry that's already
     /// in the cache. Returns the new sequence on success, `None` if
     /// the account isn't cached or the cached entry isn't an
