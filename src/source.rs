@@ -125,6 +125,53 @@ impl RpcSnapshotSource {
         self.fetch_count.load(Ordering::Relaxed)
     }
 
+    /// Apply a batch of `LedgerEntryChange`s back to the cache so that
+    /// subsequent reads see the writes. Powers the JSON-RPC server's
+    /// `sendTransaction` — recording-mode invocation gives us a list
+    /// of changes; we walk them and update the cached bytes.
+    ///
+    /// Semantics per change:
+    /// - `read_only == true` → ignored. The host won't have produced
+    ///   a `new_value` and TTL bumps don't change entry contents.
+    /// - `encoded_new_value == Some(bytes)` → overwrite the cached
+    ///   entry. Existing live-until is kept (TTL changes are tracked
+    ///   separately by the host but not yet plumbed here).
+    /// - `encoded_new_value == None` (read-write) → entry was
+    ///   removed; flip the cache to the negative-cache `None` marker
+    ///   so subsequent `get`s see absence locally without re-asking
+    ///   upstream RPC.
+    ///
+    /// `key` and `entry` decode panics in this method are the same
+    /// "structural bug, not recoverable" class as elsewhere in this
+    /// file: bytes came directly from the host that just produced
+    /// them, so a decode failure means the host violated its own
+    /// XDR-shape invariant.
+    pub fn apply_changes<I>(&self, changes: I) -> u32
+    where
+        I: IntoIterator<Item = soroban_env_host::e2e_invoke::LedgerEntryChange>,
+    {
+        let mut cache = self.cache.lock().expect("cache mutex poisoned");
+        let mut applied: u32 = 0;
+        for change in changes {
+            if change.read_only {
+                continue;
+            }
+            let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none())
+                .unwrap_or_else(|e| panic!("apply_changes: bad LedgerKey from host: {e}"));
+            match change.encoded_new_value {
+                Some(bytes) => {
+                    let live_until = change.ttl_change.as_ref().map(|t| t.new_live_until_ledger);
+                    cache.insert(key, Some((bytes, live_until)));
+                }
+                None => {
+                    cache.insert(key, None);
+                }
+            }
+            applied = applied.saturating_add(1);
+        }
+        applied
+    }
+
     /// Export the cache for persistence. Negative-cache entries (confirmed
     /// missing) are intentionally omitted — they aren't useful across
     /// processes and bloat the on-disk snapshot.

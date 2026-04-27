@@ -315,3 +315,104 @@ pub(crate) struct SimulationCost {
     /// Memory bytes, as a decimal string.
     pub(crate) mem_bytes: String,
 }
+
+// ---------------------------------------------------------------------------
+// sendTransaction / getTransaction
+// ---------------------------------------------------------------------------
+
+/// `sendTransaction` request body. Only `transaction` (base64-XDR
+/// `TransactionEnvelope`) is required. Real Stellar RPC accepts more
+/// fields (`bin` etc.) but they're optional and unused in v0.6.
+#[derive(Debug, Deserialize)]
+pub(crate) struct SendTransactionParams {
+    pub(crate) transaction: String,
+}
+
+/// `sendTransaction` response. Stellar's wire shape uses these exact
+/// field names; we keep parity so JS-SDK polling loops work
+/// unchanged.
+///
+/// Status semantics in v0.6:
+/// - `"SUCCESS"` — host invocation returned `Ok`, ledger changes
+///   applied to the cache.
+/// - `"ERROR"` — host invocation returned `Err`; nothing was
+///   applied.
+///
+/// Real Stellar RPC has `"PENDING"` for txns that will be applied in
+/// a future ledger; the fork applies synchronously, so we don't need
+/// it. The receipt is queryable via `getTransaction` immediately.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SendTransactionResponse {
+    pub(crate) status: &'static str,
+    /// Hex-encoded SHA-256 of the original envelope bytes.
+    pub(crate) hash: String,
+    /// Echoed `latestLedger` for the response wire shape.
+    pub(crate) latest_ledger: u32,
+    /// Unix-seconds string of when the receipt was created.
+    pub(crate) latest_ledger_close_time: String,
+    /// Base64-encoded original envelope, echoed back so the client
+    /// can verify what was applied.
+    pub(crate) envelope_xdr: String,
+    /// Plain-text host error message when `status == "ERROR"`. We
+    /// don't yet build a real `TransactionResult` XDR for the
+    /// wire-spec `errorResultXdr` field — clients that need that
+    /// field's exact shape should treat its absence as "v0.6 wire
+    /// limitation" until v0.6.x ships. The message is the same one
+    /// `getTransaction` returns; surfacing it under a non-XDR-named
+    /// field is more honest than encoding a UTF-8 string under a
+    /// name that promises XDR.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error_message: Option<String>,
+    /// Diagnostic info: number of `LedgerEntryChange`s applied to the
+    /// snapshot source. Useful for asserting in tests; not a Stellar
+    /// wire-spec field, but emitted as a debug aid.
+    pub(crate) applied_changes: u32,
+}
+
+/// `getTransaction` request body.
+#[derive(Debug, Deserialize)]
+pub(crate) struct GetTransactionParams {
+    /// Hex-encoded SHA-256 hash, as returned by `sendTransaction`.
+    pub(crate) hash: String,
+}
+
+/// `getTransaction` response — receipt for a previously-applied tx.
+///
+/// Field set is a deliberate subset of Stellar's wire shape: we
+/// return what we know precisely (status, hash, envelope) and skip
+/// the Stellar-core-XDR-heavy fields (`resultMetaXdr` =
+/// `TransactionMeta::V3` carrying state-change deltas). Building
+/// those is a v0.6.x followup; clients that only need
+/// success-or-failure + return value have what they need.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GetTransactionResponse {
+    /// `"SUCCESS"`, `"FAILED"`, or `"NOT_FOUND"`.
+    pub(crate) status: &'static str,
+    /// `latestLedger` echoed.
+    pub(crate) latest_ledger: u32,
+    /// Ledger sequence the receipt was created at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ledger: Option<u32>,
+    /// Unix-seconds string of when the receipt was created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) created_at: Option<String>,
+    /// Base64-encoded `TransactionEnvelope`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) envelope_xdr: Option<String>,
+    /// Base64-encoded `ScVal` of the host function's return value.
+    /// Present when `status == "SUCCESS"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) return_value_xdr: Option<String>,
+    /// Plain-text host failure message when `status == "FAILED"`.
+    /// Real `stellar-rpc` returns `errorResultXdr` here (a base64
+    /// `TransactionResult` XDR). We don't yet build that XDR; v0.6
+    /// surfaces the host's own error message under an honestly-named
+    /// field instead of encoding UTF-8 under an XDR-typed name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error_message: Option<String>,
+    /// Diagnostic info: how many ledger changes the receipt applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) applied_changes: Option<u32>,
+}

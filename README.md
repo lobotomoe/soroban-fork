@@ -206,7 +206,7 @@ const result = await server.simulateTransaction(tx);  // hits the fork
 Or via the Rust `stellar-rpc-client`, raw curl, or anything that
 understands the spec.
 
-### Methods supported in v0.5
+### Methods supported in v0.6
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -231,22 +231,40 @@ understands the spec.
   - `minResourceFee` — derived from the live on-chain Soroban fee
     schedule via `compute_transaction_resource_fee` (since v0.5.2)
   - `latestLedger` — fork's reported ledger
+- **`sendTransaction`** *(new in v0.6)* — applies the host invocation's
+  writes back to the snapshot source so subsequent reads see them.
+  Auth runs in trust mode (`Recording(false)`) — same UX as Anvil's
+  default for EVM tests, so unsigned envelopes from test code work
+  without ceremony. Returns `status` (`"SUCCESS"` / `"ERROR"`),
+  `hash` (sha256 of the envelope), `appliedChanges` (number of
+  `LedgerEntryChange`s written), and the original envelope echo.
+- **`getTransaction`** *(new in v0.6)* — receipt lookup by hash.
+  Returns `"SUCCESS"` / `"FAILED"` / `"NOT_FOUND"`, plus the original
+  envelope, the host function's `ScVal` return value, and the
+  applied-changes count when found.
 
-### What v0.5 server does NOT support
+### What v0.6 server does NOT support
 
 Listed up front so nothing surprises you:
 
-- **`sendTransaction` / `getTransaction`** — state-mutating writes are
-  scoped to v0.6.
-- **`getEvents`** — historical event filtering. Diagnostic events emitted
-  during simulation are reachable via `simulateTransaction`'s response.
-- **`anvil_*` cheatcodes** — `snapshot`, `revert`, `impersonate`,
-  `setBalance`, `setCode`. Scoped to v0.6 alongside `sendTransaction`.
-- *(closed in v0.5.2)* — `minResourceFee` is now computed from the live
-  on-chain fee schedule (the six `ConfigSetting` entries) via the
-  host's own `compute_transaction_resource_fee`, and `cost.memBytes`
-  reports the real `Budget::get_mem_bytes_consumed` reading rather
-  than the previous `write_bytes` proxy.
+- **`getEvents`** — historical event filtering. Diagnostic events
+  emitted during simulation are reachable via `simulateTransaction`'s
+  response.
+- **`anvil_*` cheatcodes** — `setBalance`, `setStorage`, `setCode`,
+  `impersonate`. Scoped to v0.7 alongside the cheatcode primitives.
+- **`anvil_snapshot` / `anvil_revert`** — saved-state checkpoints.
+  Scoped to v0.8 (the `Rc<HostImpl>` snapshot model needs its own
+  design pass).
+- **`sendTransaction` ledger advancement** — each successful send
+  applies its writes to the snapshot source but does not yet bump
+  `env.ledger().sequence_number()`. Time-sensitive contract logic
+  (vesting, oracle staleness checks) sees the same ledger across
+  multiple sends until you call `env.warp(...)` from lib mode.
+  Block-by-side-effect is a v0.6.x followup.
+- **`resultMetaXdr` on `getTransaction`** — Stellar's
+  `TransactionMeta::V3` carries state-change deltas in a
+  Stellar-core-XDR-heavy shape; v0.6 returns `returnValueXdr` and
+  `appliedChanges` instead. Full meta XDR is a v0.6.x followup.
 
 ### Architecture: single-threaded actor
 
@@ -428,7 +446,7 @@ that were lazy-fetched during the test. This means the second run of a test with
 
 What soroban-fork does NOT yet do — listed up front so nothing surprises you in production:
 
-- **No `sendTransaction` / state mutation through RPC.** v0.5's server mode is read+simulate only. Library-mode users can mutate state via `env.invoke_contract` (it's a real `Env` underneath). Server-mode `sendTransaction` plus `anvil_*` cheatcodes (impersonate / setBalance / setCode / snapshot / revert) are planned for v0.6.
+- ~~**No `sendTransaction` / state mutation through RPC.**~~ *(closed in v0.6.)* Server-mode `sendTransaction` now applies writes back to the snapshot source so subsequent reads see them; `getTransaction` retrieves receipts by hash. `anvil_*` cheatcodes (impersonate / setBalance / setCode) are still scoped to v0.7; `anvil_snapshot` / `anvil_revert` to v0.8.
 - **No TTL / archival simulation.** Soroban entries carry a `live_until_ledger_seq`; on real mainnet they become archived past that ledger and need a `RestoreFootprint` operation. We track `live_until` in the cache but do not yet model expiry — bumping `env.ledger()` past an entry's `live_until` will not flip it to archived. Tests that depend on TTL-expiry semantics will see false-positives.
 - **No historical state.** `at_ledger(N)` shifts only what `env.ledger().sequence_number()` reports; the actual ledger entries are always fetched at the RPC's *current* latest. Pin to a specific ledger only when paired with `cache_file` for reproducibility, not when expecting historical state.
 - **Tracing renders structure, not metering.** `env.trace()` captures the call tree with decoded args and return values. It does **not** yet render per-frame gas / cost units, contract events, or decoded `HostError` reasons. (Diagnostic events from the host carry call structure but not metering numbers; metering is planned. Server-mode `simulateTransaction` does return real `cost.cpuInsns` separately.)

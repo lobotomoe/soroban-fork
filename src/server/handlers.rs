@@ -17,8 +17,9 @@ use soroban_env_host::xdr::{Limits, ReadXdr, WriteXdr};
 use crate::server::actor::{ActorHandle, Command, SimulationReply};
 use crate::server::types::{
     GetLedgerEntriesParams, GetLedgerEntriesResponse, GetLedgersParams, GetLedgersResponse,
-    HealthResponse, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LatestLedgerResponse,
-    LedgerEntryItem, LedgerInfo, NetworkResponse, SimulateHostFunctionResult,
+    GetTransactionParams, GetTransactionResponse, HealthResponse, JsonRpcError, JsonRpcRequest,
+    JsonRpcResponse, LatestLedgerResponse, LedgerEntryItem, LedgerInfo, NetworkResponse,
+    SendTransactionParams, SendTransactionResponse, SimulateHostFunctionResult,
     SimulateTransactionParams, SimulateTransactionResponse, SimulationCost, VersionInfoResponse,
 };
 
@@ -79,6 +80,8 @@ async fn dispatch(
         "getLedgers" => handle_get_ledgers(state, &req.params).await,
         "getLedgerEntries" => handle_get_ledger_entries(state, &req.params).await,
         "simulateTransaction" => handle_simulate_transaction(state, &req.params).await,
+        "sendTransaction" => handle_send_transaction(state, &req.params).await,
+        "getTransaction" => handle_get_transaction(state, &req.params).await,
         unknown => {
             warn!("soroban-fork: unsupported RPC method: {unknown}");
             Err(JsonRpcError::method_not_found(unknown))
@@ -464,4 +467,164 @@ fn encode_simulation_reply(reply: SimulationReply) -> Result<serde_json::Value, 
         error: None,
     };
     serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+}
+
+async fn handle_send_transaction(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let parsed: SendTransactionParams = serde_json::from_value(params.clone())
+        .map_err(|e| JsonRpcError::invalid_params(format!("sendTransaction params: {e}")))?;
+
+    let envelope_bytes = BASE64
+        .decode(&parsed.transaction)
+        .map_err(|e| JsonRpcError::invalid_params(format!("transaction: base64 decode: {e}")))?;
+    let envelope =
+        soroban_env_host::xdr::TransactionEnvelope::from_xdr(&envelope_bytes, Limits::none())
+            .map_err(|e| JsonRpcError::invalid_params(format!("transaction: XDR decode: {e}")))?;
+
+    let (host_function, source_account) = extract_invoke_op(&envelope)?;
+    let envelope_b64 = parsed.transaction.clone();
+
+    let send_reply = state
+        .actor
+        .send(|tx| Command::SendTransaction {
+            envelope_bytes,
+            host_function,
+            source_account,
+            reply: tx,
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    // Pull the latest-ledger metadata in a separate command — keeps
+    // the actor message focused on the work it has to do, and the
+    // wire response gets the live ledger info clients expect.
+    let latest = state
+        .actor
+        .send(|tx| Command::GetLatestLedger { reply: tx })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+    let close_time = state
+        .actor
+        .send(|tx| Command::GetLedgersPage { reply: tx })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?
+        .close_time;
+
+    let (status, error_message) = match &send_reply.receipt.result {
+        Ok(_) => ("SUCCESS", None),
+        Err(msg) => ("ERROR", Some(msg.clone())),
+    };
+
+    let body = SendTransactionResponse {
+        status,
+        hash: hex_lower(&send_reply.hash),
+        latest_ledger: latest.sequence,
+        latest_ledger_close_time: close_time.to_string(),
+        envelope_xdr: envelope_b64,
+        error_message,
+        applied_changes: send_reply.receipt.applied_changes,
+    };
+    serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+}
+
+async fn handle_get_transaction(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let parsed: GetTransactionParams = serde_json::from_value(params.clone())
+        .map_err(|e| JsonRpcError::invalid_params(format!("getTransaction params: {e}")))?;
+
+    let hash = parse_hex32(&parsed.hash)
+        .ok_or_else(|| JsonRpcError::invalid_params("hash: must be 64-char hex"))?;
+
+    let receipt = state
+        .actor
+        .send(|tx| Command::GetTransaction { hash, reply: tx })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+    let latest = state
+        .actor
+        .send(|tx| Command::GetLatestLedger { reply: tx })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    let body = match receipt {
+        None => GetTransactionResponse {
+            status: "NOT_FOUND",
+            latest_ledger: latest.sequence,
+            ledger: None,
+            created_at: None,
+            envelope_xdr: None,
+            return_value_xdr: None,
+            error_message: None,
+            applied_changes: None,
+        },
+        Some(r) => {
+            let envelope_xdr = Some(BASE64.encode(&r.envelope_bytes));
+            match &r.result {
+                Ok(scval) => {
+                    let bytes = scval.to_xdr(Limits::none()).map_err(|e| {
+                        JsonRpcError::internal_error(format!("encode return ScVal: {e}"))
+                    })?;
+                    GetTransactionResponse {
+                        status: "SUCCESS",
+                        latest_ledger: latest.sequence,
+                        ledger: Some(r.ledger),
+                        created_at: Some(r.created_at.to_string()),
+                        envelope_xdr,
+                        return_value_xdr: Some(BASE64.encode(&bytes)),
+                        error_message: None,
+                        applied_changes: Some(r.applied_changes),
+                    }
+                }
+                Err(msg) => GetTransactionResponse {
+                    status: "FAILED",
+                    latest_ledger: latest.sequence,
+                    ledger: Some(r.ledger),
+                    created_at: Some(r.created_at.to_string()),
+                    envelope_xdr,
+                    return_value_xdr: None,
+                    error_message: Some(msg.clone()),
+                    applied_changes: Some(r.applied_changes),
+                },
+            }
+        }
+    };
+    serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+}
+
+/// Lower-case hex of a 32-byte hash for the `hash` wire field.
+fn hex_lower(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Inverse of `hex_lower` for `getTransaction` lookups. Returns `None`
+/// on any malformed input rather than threading a typed error — the
+/// caller turns it into `invalid_params`.
+fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }

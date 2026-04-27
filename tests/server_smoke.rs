@@ -12,14 +12,16 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::Value;
 use soroban_env_host::xdr::{
-    AccountId, ContractDataDurability, ContractId, Hash, HostFunction, InvokeContractArgs,
-    InvokeHostFunctionOp, LedgerKey, LedgerKeyContractData, Limits, Memo, MuxedAccount, Operation,
-    OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScSymbol, ScVal, SequenceNumber,
-    Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, WriteXdr,
+    AccountId, ContractDataDurability, ContractId, Hash, HostFunction, Int128Parts,
+    InvokeContractArgs, InvokeHostFunctionOp, LedgerKey, LedgerKeyContractData, Limits, Memo,
+    MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScSymbol,
+    ScVal, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope,
+    Uint256, WriteXdr,
 };
 use soroban_fork::{server::Server, ForkConfig};
 
 const XLM_SAC: &str = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA";
+const USDC_SAC: &str = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75";
 
 fn mainnet_rpc() -> String {
     std::env::var("MAINNET_RPC_URL")
@@ -278,12 +280,212 @@ async fn server_returns_method_not_found_for_unknown() {
     let (url, running) = start_test_server().await;
     let client = reqwest::Client::new();
 
-    let resp = jsonrpc_call(&client, &url, "sendTransaction", serde_json::json!({})).await;
+    // `getEvents` is not in the v0.6 method set (planned for later).
+    // Real Stellar RPC implements it; ours doesn't yet, so it should
+    // hit the dispatch catch-all and return -32601.
+    let resp = jsonrpc_call(&client, &url, "getEvents", serde_json::json!({})).await;
     assert_eq!(resp["error"]["code"], -32601);
     assert!(resp["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("sendTransaction"));
+        .contains("getEvents"));
+
+    running.shutdown().await.expect("shutdown");
+}
+
+/// End-to-end write-persistence test:
+///
+/// 1. Build a `USDC.mint(alice, AMOUNT)` envelope.
+/// 2. POST `sendTransaction` — expect status `"SUCCESS"` and
+///    `appliedChanges > 0` (real writes hit the snapshot source).
+/// 3. POST `getTransaction(hash)` — receipt is retrievable, status
+///    matches.
+/// 4. POST `simulateTransaction` for `USDC.balance(alice)` — must
+///    return the minted amount, proving that the post-send snapshot
+///    source surfaced the write to a fresh recording-mode sandbox.
+///
+/// Auth note: the worker runs `RecordingInvocationAuthMode::Recording(false)`,
+/// which bypasses non-root authorizations. The SAC's admin
+/// `require_auth` for `mint` is recorded but not enforced — same UX
+/// as Anvil's default trust mode. Real `sendTransaction` against
+/// stellar-rpc would reject this without a signed admin envelope.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
+async fn server_send_transaction_persists_state() {
+    // 1,000,000 USDC at 7-decimal scale.
+    const AMOUNT: i128 = 1_000_000 * 10_000_000;
+
+    let (url, running) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Recipient is a synthetic *contract* address. Stellar SACs
+    // require trustline entries for account recipients (we observed
+    // `Error(Contract, #13)` "trustline entry is missing" when we
+    // tried minting to an Account ScAddress) — but contract
+    // recipients skip that check, which mirrors how DeFi vaults and
+    // pools receive SAC tokens in production.
+    let mut contract_id = [0u8; 32];
+    contract_id[0] = 0xa1;
+    contract_id[1] = 0x1c;
+    contract_id[2] = 0xe0;
+    let alice_addr = ScAddress::Contract(ContractId(Hash(contract_id)));
+
+    let usdc_id = decode_contract_id(USDC_SAC);
+    let mint_envelope_b64 = build_invoke_envelope(
+        &usdc_id,
+        "mint",
+        vec![ScVal::Address(alice_addr.clone()), i128_to_scval(AMOUNT)],
+    );
+
+    // 1. sendTransaction
+    let send_resp = jsonrpc_call(
+        &client,
+        &url,
+        "sendTransaction",
+        serde_json::json!({ "transaction": mint_envelope_b64 }),
+    )
+    .await;
+    eprintln!("\nsendTransaction(mint) response:\n{send_resp:#}\n");
+
+    assert_eq!(
+        send_resp["result"]["status"], "SUCCESS",
+        "mint should succeed in trust-mode (Recording(false)); error: {:?}",
+        send_resp["result"]["errorResultXdr"]
+    );
+    let applied: u64 = send_resp["result"]["appliedChanges"]
+        .as_u64()
+        .expect("appliedChanges field");
+    assert!(
+        applied > 0,
+        "mint must apply at least one ledger change, got {applied}"
+    );
+    let hash = send_resp["result"]["hash"]
+        .as_str()
+        .expect("hash field")
+        .to_string();
+    assert_eq!(hash.len(), 64, "hash should be 32-byte hex (64 chars)");
+
+    // 2. getTransaction(hash) — receipt round-trip
+    let get_resp = jsonrpc_call(
+        &client,
+        &url,
+        "getTransaction",
+        serde_json::json!({ "hash": hash }),
+    )
+    .await;
+    assert_eq!(
+        get_resp["result"]["status"], "SUCCESS",
+        "receipt status must reflect mint success"
+    );
+    assert!(
+        get_resp["result"]["envelopeXdr"].is_string(),
+        "receipt should echo envelopeXdr"
+    );
+    assert_eq!(
+        get_resp["result"]["appliedChanges"], applied,
+        "receipt's appliedChanges should match send response"
+    );
+
+    // 3. simulateTransaction(USDC.balance(alice)) — proves the mint
+    //    persisted into the snapshot source. A fresh recording-mode
+    //    sandbox reads from the same source and must see the new
+    //    balance entry.
+    let balance_envelope_b64 = build_invoke_envelope(
+        &usdc_id,
+        "balance",
+        vec![ScVal::Address(alice_addr.clone())],
+    );
+    let bal_resp = jsonrpc_call(
+        &client,
+        &url,
+        "simulateTransaction",
+        serde_json::json!({ "transaction": balance_envelope_b64 }),
+    )
+    .await;
+    assert!(
+        bal_resp["result"]["error"].is_null(),
+        "balance simulation should not error; got {bal_resp:#}"
+    );
+
+    let xdr_b64 = bal_resp["result"]["results"][0]["xdr"]
+        .as_str()
+        .expect("balance simulation results[0].xdr");
+    let xdr_bytes = BASE64.decode(xdr_b64).expect("base64 decode");
+    let scval = ScVal::from_xdr(&xdr_bytes, Limits::none()).expect("decode ScVal");
+    let bal = match scval {
+        ScVal::I128(parts) => ((parts.hi as i128) << 64) | (parts.lo as i128),
+        other => panic!("expected I128 from balance(), got {other:?}"),
+    };
+    assert_eq!(
+        bal, AMOUNT,
+        "balance must reflect the mint we just sent (writes persisted)"
+    );
+
+    running.shutdown().await.expect("shutdown");
+}
+
+/// Helper: build a base64-XDR `TransactionEnvelope` carrying a single
+/// `InvokeHostFunctionOp` against `(contract_id, function_name, args)`.
+/// Source account is the all-zeros key (recording-mode doesn't care).
+fn build_invoke_envelope(contract_id: &[u8; 32], function_name: &str, args: Vec<ScVal>) -> String {
+    let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: ScAddress::Contract(ContractId(Hash(*contract_id))),
+        function_name: ScSymbol(function_name.try_into().expect("symbol fits")),
+        args: args.try_into().expect("args fit VecM"),
+    });
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: host_fn,
+            auth: vec![].try_into().expect("empty auth"),
+        }),
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+        fee: 0,
+        seq_num: SequenceNumber(0),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().expect("ops fit VecM"),
+        ext: TransactionExt::V0,
+    };
+    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: vec![].try_into().expect("empty signatures"),
+    });
+    BASE64.encode(envelope.to_xdr(Limits::none()).expect("encode envelope"))
+}
+
+/// Helper: encode an `i128` as `ScVal::I128(Int128Parts { hi, lo })`.
+fn i128_to_scval(v: i128) -> ScVal {
+    ScVal::I128(Int128Parts {
+        hi: (v >> 64) as i64,
+        lo: v as u64,
+    })
+}
+
+/// `getTransaction` for an unknown hash returns `NOT_FOUND`. Confirms
+/// the receipt store correctly distinguishes "never sent" from "sent
+/// and failed".
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
+async fn server_get_transaction_unknown_hash_is_not_found() {
+    let (url, running) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let zero_hash = "0".repeat(64);
+    let resp = jsonrpc_call(
+        &client,
+        &url,
+        "getTransaction",
+        serde_json::json!({ "hash": zero_hash }),
+    )
+    .await;
+    assert_eq!(resp["result"]["status"], "NOT_FOUND");
+    assert!(
+        resp["result"]["envelopeXdr"].is_null(),
+        "NOT_FOUND should not carry an envelope"
+    );
 
     running.shutdown().await.expect("shutdown");
 }

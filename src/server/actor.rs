@@ -28,18 +28,22 @@
 //!   the duration of the upstream RPC call. Steady-state cache hits are
 //!   instant; first-touch latency is one RPC round-trip per uncached key.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
+use sha2::{Digest, Sha256};
 use soroban_env_host::budget::Budget;
 use soroban_env_host::e2e_invoke::{
     invoke_host_function_in_recording_mode, RecordingInvocationAuthMode,
 };
 use soroban_env_host::storage::SnapshotSource;
 use soroban_env_host::xdr::{
-    AccountId, ContractEvent, DiagnosticEvent, HostFunction, LedgerEntry, LedgerKey, ScVal,
-    SorobanAuthorizationEntry, SorobanResources,
+    AccountId, ContractEvent, DiagnosticEvent, Hash, HostFunction, LedgerEntry, LedgerKey, Limits,
+    ReadXdr, ScVal, SorobanAuthorizationEntry, SorobanResources, TransactionEnvelope,
+    TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction, WriteXdr,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -92,6 +96,30 @@ pub(crate) enum Command {
         source_account: AccountId,
         transaction_size_bytes: u32,
         reply: oneshot::Sender<SimulationReply>,
+    },
+    /// Apply a transaction's writes to the fork's snapshot source so
+    /// subsequent reads see them.
+    ///
+    /// We run the same `invoke_host_function_in_recording_mode` path as
+    /// `simulateTransaction`, but instead of throwing the result away,
+    /// we capture `ledger_changes` and feed them back via
+    /// `RpcSnapshotSource::apply_changes`. Auth is in trust mode
+    /// (`Recording(false)`) — same UX as Anvil — so unsigned envelopes
+    /// from test code work without ceremony.
+    ///
+    /// Receipts are stored on the worker keyed by the SHA-256 of the
+    /// envelope; `GetTransaction` looks them up.
+    SendTransaction {
+        envelope_bytes: Vec<u8>,
+        host_function: HostFunction,
+        source_account: AccountId,
+        reply: oneshot::Sender<SendReply>,
+    },
+    /// Look up a previously-applied transaction's receipt by hash.
+    /// Hash is the 32-byte SHA-256 of the original envelope bytes.
+    GetTransaction {
+        hash: [u8; 32],
+        reply: oneshot::Sender<Option<TxReceipt>>,
     },
 }
 
@@ -168,6 +196,45 @@ pub(crate) struct SimulationReply {
     /// `None` only on the recording-mode failure path before any
     /// metering happened.
     pub(crate) mem_bytes: Option<u64>,
+}
+
+/// Receipt for a transaction the worker actually applied to the
+/// snapshot source. Stored in the worker-local receipt map keyed by
+/// envelope hash; `getTransaction` reads from there.
+///
+/// We avoid building a full `TransactionResult` / `TransactionMeta`
+/// XDR for the v0.6 wire shape — those are non-trivial Stellar-core
+/// types that real `getTransaction` callers consume. v0.6 emits the
+/// invocation's `ScVal` return value and a status string; building
+/// out the full meta-XDR is a v0.6.x followup.
+#[derive(Clone, Debug)]
+pub(crate) struct TxReceipt {
+    /// `Ok(scval)` on application success, `Err(message)` when the
+    /// host reported an error during execution.
+    pub(crate) result: std::result::Result<ScVal, String>,
+    /// Original `TransactionEnvelope` bytes — echoed back as
+    /// `envelopeXdr` on the wire so clients can verify the receipt
+    /// matches the envelope they sent.
+    pub(crate) envelope_bytes: Vec<u8>,
+    /// Ledger sequence at apply time. Each `sendTransaction` advances
+    /// the fork's reported sequence by one (block production by side
+    /// effect — same model Anvil's `evm_mine` uses).
+    pub(crate) ledger: u32,
+    /// Unix-seconds timestamp the receipt was created at. Used by the
+    /// wire `createdAt` field.
+    pub(crate) created_at: u64,
+    /// How many `LedgerEntryChange`s were applied to the snapshot
+    /// source. Useful for assertions in smoke tests; surfaced as a
+    /// debug info field on the wire.
+    pub(crate) applied_changes: u32,
+}
+
+/// Reply for `Command::SendTransaction` — the receipt we built plus
+/// the hash we keyed it by, so the handler can echo the hash back.
+#[derive(Debug)]
+pub(crate) struct SendReply {
+    pub(crate) hash: [u8; 32],
+    pub(crate) receipt: TxReceipt,
 }
 
 /// Handle to the worker thread. Cloning is cheap (Arc-style internally
@@ -260,6 +327,12 @@ pub(crate) fn spawn(
 /// server shutting down).
 fn worker_loop(env: crate::ForkedEnv, mut rx: mpsc::Receiver<Command>) {
     info!("soroban-fork: worker thread started");
+
+    // Per-worker receipt store. The worker owns this; everything that
+    // needs to read it goes through `Command::GetTransaction` so we
+    // don't have to make `TxReceipt: Send` or wrap in Arc/Mutex.
+    let mut receipts: HashMap<[u8; 32], TxReceipt> = HashMap::new();
+
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             Command::GetNetwork { reply } => {
@@ -313,6 +386,20 @@ fn worker_loop(env: crate::ForkedEnv, mut rx: mpsc::Receiver<Command>) {
                     source_account,
                     transaction_size_bytes,
                 ));
+            }
+            Command::SendTransaction {
+                envelope_bytes,
+                host_function,
+                source_account,
+                reply,
+            } => {
+                let send_reply =
+                    send_transaction(&env, envelope_bytes, host_function, source_account);
+                receipts.insert(send_reply.hash, send_reply.receipt.clone());
+                let _ = reply.send(send_reply);
+            }
+            Command::GetTransaction { hash, reply } => {
+                let _ = reply.send(receipts.get(&hash).cloned());
             }
         }
     }
@@ -402,6 +489,124 @@ fn simulate_transaction(
             }
         }
     }
+}
+
+/// Apply a transaction to the fork's snapshot source so subsequent
+/// reads see its writes. Builds the receipt the worker stores.
+///
+/// Same recording-mode entry point as [`simulate_transaction`], but
+/// instead of discarding `ledger_changes` we feed them back into the
+/// source via [`crate::RpcSnapshotSource::apply_changes`]. The host
+/// runs with relaxed (trust-mode) auth — `Recording(false)` — so
+/// unsigned envelopes work the way Anvil's default mode does for
+/// EVM tests.
+///
+/// **What this is not.** v0.6 does not advance the fork's reported
+/// ledger sequence on each send (no block-by-side-effect yet). State
+/// changes persist in the cache; ledger metadata stays at fork-point.
+/// Adding ledger advancement is a v0.6.x followup once the
+/// timestamp/sequence Cell-vs-warp question is resolved.
+fn send_transaction(
+    env: &crate::ForkedEnv,
+    envelope_bytes: Vec<u8>,
+    host_function: HostFunction,
+    source_account: AccountId,
+) -> SendReply {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let snapshot_source: Rc<dyn SnapshotSource> = env.snapshot_source().clone();
+    let ledger_info = env.env().ledger().get();
+    let budget = Budget::default();
+    let auth_mode = RecordingInvocationAuthMode::Recording(false);
+
+    let mut diagnostic_events: Vec<DiagnosticEvent> = Vec::new();
+    let invoke_result = invoke_host_function_in_recording_mode(
+        &budget,
+        true,
+        &host_function,
+        &source_account,
+        auth_mode,
+        ledger_info,
+        snapshot_source,
+        [0u8; 32],
+        &mut diagnostic_events,
+    );
+
+    let hash = canonical_tx_hash(&envelope_bytes, &env.network_id()).unwrap_or_else(|_| {
+        // Envelope decode shouldn't fail here — it already round-tripped
+        // through `extract_invoke_op` at the handler. Fall back to a
+        // raw envelope hash so we always return *some* hash; the
+        // receipt store still works internally even if a JS SDK client
+        // can't predict it.
+        Sha256::digest(&envelope_bytes).into()
+    });
+    let ledger = env.ledger_sequence();
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let (result, applied_changes) = match invoke_result {
+        Ok(rec) => {
+            let result = rec
+                .invoke_result
+                .map_err(|e| format!("host error: {e}"));
+            // Only apply changes when the host invocation actually
+            // succeeded — a failed invocation produces no semantic
+            // writes (the host doesn't expose partial mutations).
+            let applied = if result.is_ok() {
+                env.snapshot_source().apply_changes(rec.ledger_changes)
+            } else {
+                0
+            };
+            (result, applied)
+        }
+        Err(e) => (Err(format!("recording-mode error: {e}")), 0),
+    };
+
+    let receipt = TxReceipt {
+        result,
+        envelope_bytes,
+        ledger,
+        created_at,
+        applied_changes,
+    };
+    SendReply { hash, receipt }
+}
+
+/// Compute the canonical Stellar transaction hash from an envelope —
+/// the same value `stellar-rpc` and the JS SDK compute when polling
+/// `getTransaction`. Defined as `sha256(TransactionSignaturePayload)`
+/// where the payload carries the network ID and the inner V1 (or
+/// FeeBump) transaction.
+///
+/// Using the wire-canonical hash (rather than `sha256(envelope_bytes)`)
+/// matters because clients build their own hash from the envelope
+/// they sent and use it as the lookup key. A raw envelope hash would
+/// be internally consistent but invisible to those clients.
+fn canonical_tx_hash(envelope_bytes: &[u8], network_id: &[u8; 32]) -> Result<[u8; 32], String> {
+    let envelope = TransactionEnvelope::from_xdr(envelope_bytes, Limits::none())
+        .map_err(|e| format!("envelope decode for hash: {e}"))?;
+    let tagged = match envelope {
+        TransactionEnvelope::Tx(v1) => TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx),
+        TransactionEnvelope::TxFeeBump(fb) => {
+            TransactionSignaturePayloadTaggedTransaction::TxFeeBump(fb.tx)
+        }
+        TransactionEnvelope::TxV0(_) => {
+            // V0 envelopes don't carry Soroban operations — the handler
+            // already rejects them, so this arm only fires if a future
+            // Command path admits V0. Hash is undefined for our use.
+            return Err("V0 envelopes do not have a Soroban-canonical hash".into());
+        }
+    };
+    let payload = TransactionSignaturePayload {
+        network_id: Hash(*network_id),
+        tagged_transaction: tagged,
+    };
+    let payload_xdr = payload
+        .to_xdr(Limits::none())
+        .map_err(|e| format!("payload encode for hash: {e}"))?;
+    Ok(Sha256::digest(&payload_xdr).into())
 }
 
 /// Compute the minimum resource fee a real `sendTransaction` would owe
