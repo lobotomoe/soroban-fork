@@ -512,7 +512,7 @@ What soroban-fork does NOT yet do — listed up front so nothing surprises you i
 
 ## Requirements
 
-- Rust 1.85+ (transitive deps require `edition2024`)
+- Rust 1.88+ (transitive deps in the Stellar/Soroban tree require it)
 - `soroban-sdk` 25.x (with `testutils` feature)
 - Network access to a Soroban RPC endpoint
 
