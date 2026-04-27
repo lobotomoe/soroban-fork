@@ -504,6 +504,71 @@ pub(crate) struct SetCodeResponse {
     pub(crate) latest_ledger: u32,
 }
 
+/// `fork_setBalance` request: set a Stellar account's balance for
+/// a given Classic asset. Foundry's `deal()`-equivalent.
+///
+/// - `account`: strkey ("G...") of the Stellar account.
+/// - `amount`: i64 stroops as a decimal string. Strings (not
+///   numbers) so values past JSON's safe-integer range survive.
+/// - `asset`: optional. Defaults to native XLM (`"native"`).
+///   For credit assets, pass `{ code, issuer }`.
+///
+/// Auto-creates the underlying `AccountEntry` (native) or
+/// `TrustLineEntry` (credit) if it doesn't exist yet — matches
+/// Foundry-deal UX where the balance just shows up.
+///
+/// **Soroban-native tokens not supported in v0.8.4** — the SAC
+/// `mint`/`burn` invocation path with trust-mode auth is its own
+/// scope and ships in v0.8.5. For now, Soroban tokens whose
+/// underlying balance lives in a Classic asset (e.g. mainnet USDC
+/// SAC, which routes to the AlphaNum4 USDC trustline) work via
+/// the credit-asset path: write the trustline directly, the SAC
+/// reads from the same entry.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetBalanceParams {
+    pub(crate) account: String,
+    pub(crate) amount: String,
+    #[serde(default)]
+    pub(crate) asset: Option<AssetWire>,
+}
+
+/// Wire encoding for the `asset` field on `fork_setBalance`. Two
+/// shapes:
+/// - `"native"` (string) → XLM, balance lives on `AccountEntry`.
+/// - `{ "code": "USDC", "issuer": "GA5Z..." }` → Classic credit
+///   asset; balance lives on `TrustLineEntry`. Code length 1–4
+///   uses AlphaNum4; 5–12 uses AlphaNum12.
+///
+/// Untagged so the JSON looks natural (no `"type": "native"`
+/// ceremony). serde tries the variants in order and uses the
+/// first one that matches.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum AssetWire {
+    Native(NativeMarker),
+    Credit { code: String, issuer: String },
+}
+
+/// Marker for the `"native"` string variant of `AssetWire`. Using
+/// a discriminated string instead of a unit variant because serde's
+/// untagged + unit-variant interaction doesn't deserialise from
+/// `"native"` cleanly.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NativeMarker {
+    Native,
+}
+
+/// `fork_setBalance` response — same shape as `fork_setStorage` /
+/// `fork_setLedgerEntry`. No hash to echo back.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetBalanceResponse {
+    pub(crate) ok: bool,
+    pub(crate) latest_ledger: u32,
+}
+
 /// `getTransaction` response — receipt for a previously-applied tx.
 ///
 /// Field set is a deliberate subset of Stellar's wire shape: we

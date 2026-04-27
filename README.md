@@ -263,7 +263,7 @@ Soroswap, etc.) follow the same pattern: dependencies the deployed
 contract reaches into get lazy-fetched from mainnet and cached
 locally.
 
-### Methods supported in v0.8.3
+### Methods supported in v0.8.4
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -330,6 +330,22 @@ client can distinguish "this works against any Stellar RPC" from
   follow-up `CreateContract` (or `fork_setStorage` over a
   `ContractInstance` ScVal) to point at the uploaded code without
   any host invocation.
+- **`fork_setBalance`** *(new in v0.8.4)* — Foundry's
+  `deal()`-equivalent for Stellar Classic assets. Sets an
+  account's balance for native XLM (`AccountEntry`) or a credit
+  asset (`TrustLineEntry`); auto-creates the underlying entry if
+  it doesn't exist yet, with sensible defaults. Takes `account`
+  (G-strkey), `amount` (i64 stroops as a string — Stellar
+  precision-safe convention), and optional `asset` (`"native"` by
+  default, or `{ code, issuer }` for credit assets). For credit
+  auto-create the trustline gets `flags = AUTHORIZED`,
+  `limit = i64::MAX` — equivalent to having run `ChangeTrust` and
+  the issuer authorising it. **Soroban-native token mint/burn
+  (the SAC `mint(to, amount)` invocation path) is scoped to
+  v0.8.5** — for now Soroban tokens whose underlying balance lives
+  in a Classic asset (e.g. mainnet USDC SAC, which routes to the
+  AlphaNum4 USDC trustline) work via the credit-asset path: write
+  the trustline directly, the SAC reads from the same entry.
 - **`fork_closeLedgers`** *(new in v0.8, renamed from `anvil_mine` in v0.8.1)* —
   close `ledgers` ledgers (default 1) and bump close-time by
   `timestampAdvanceSeconds` (default `ledgers * 5` — Stellar's
@@ -338,19 +354,25 @@ client can distinguish "this works against any Stellar RPC" from
   staleness) past thresholds without orchestrating real
   transactions.
 
-### What v0.8.3 server does NOT support
+### What v0.8.4 server does NOT support
 
 Listed up front so nothing surprises you:
 
 - **`getEvents`** — historical event filtering. Diagnostic events
   emitted during simulation are reachable via `simulateTransaction`'s
   response.
-- **Ergonomic `fork_*` wrappers** — `setBalance`, `setNonce`,
-  `impersonate`, `etch` (one-call code-swap under an existing
-  contract). The primitive `fork_setLedgerEntry` covers all of
-  these once the client constructs the right XDR;
-  `fork_setStorage` (v0.8.2) and `fork_setCode` (v0.8.3) are the
-  sugar wrappers landed so far, the rest follow in v0.8.x.
+- **Soroban-native token balances** — `fork_setBalance` covers
+  Classic assets only in v0.8.4. For tokens whose balance lives
+  in a contract's storage (custom Soroban tokens that don't route
+  through a Classic SAC), use `fork_setStorage` directly with the
+  token's known balance-key shape, or wait for v0.8.5's `mint`
+  invocation path.
+- **Ergonomic `fork_*` wrappers** — `setNonce`, `impersonate`,
+  `etch` (one-call code-swap under an existing contract). The
+  primitive `fork_setLedgerEntry` covers all of these once the
+  client constructs the right XDR; `fork_setStorage` (v0.8.2),
+  `fork_setCode` (v0.8.3), `fork_setBalance` (v0.8.4) are the
+  sugar wrappers landed so far.
 - **`fork_snapshot` / `fork_revert`** — saved-state checkpoints.
   Scoped to v0.9 (the `Rc<HostImpl>` snapshot model needs its own
   design pass — either a journaling layer over `RpcSnapshotSource`

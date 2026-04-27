@@ -16,13 +16,14 @@ use soroban_env_host::xdr::{Limits, ReadXdr, WriteXdr};
 
 use crate::server::actor::{ActorHandle, Command, SimulationReply};
 use crate::server::types::{
-    CloseLedgersParams, CloseLedgersResponse, GetLedgerEntriesParams, GetLedgerEntriesResponse,
-    GetLedgersParams, GetLedgersResponse, GetTransactionParams, GetTransactionResponse,
-    HealthResponse, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LatestLedgerResponse,
-    LedgerEntryItem, LedgerInfo, NetworkResponse, SendTransactionParams, SendTransactionResponse,
-    SetCodeParams, SetCodeResponse, SetLedgerEntryParams, SetLedgerEntryResponse, SetStorageParams,
-    SimulateHostFunctionResult, SimulateTransactionParams, SimulateTransactionResponse,
-    SimulationCost, StorageDurability, VersionInfoResponse,
+    AssetWire, CloseLedgersParams, CloseLedgersResponse, GetLedgerEntriesParams,
+    GetLedgerEntriesResponse, GetLedgersParams, GetLedgersResponse, GetTransactionParams,
+    GetTransactionResponse, HealthResponse, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
+    LatestLedgerResponse, LedgerEntryItem, LedgerInfo, NetworkResponse, SendTransactionParams,
+    SendTransactionResponse, SetBalanceParams, SetBalanceResponse, SetCodeParams, SetCodeResponse,
+    SetLedgerEntryParams, SetLedgerEntryResponse, SetStorageParams, SimulateHostFunctionResult,
+    SimulateTransactionParams, SimulateTransactionResponse, SimulationCost, StorageDurability,
+    VersionInfoResponse,
 };
 
 /// Shared HTTP-layer state. Cheap to clone (the actor handle clones an
@@ -87,6 +88,7 @@ async fn dispatch(
         "fork_setLedgerEntry" => handle_fork_set_ledger_entry(state, &req.params).await,
         "fork_setStorage" => handle_fork_set_storage(state, &req.params).await,
         "fork_setCode" => handle_fork_set_code(state, &req.params).await,
+        "fork_setBalance" => handle_fork_set_balance(state, &req.params).await,
         "fork_closeLedgers" => handle_fork_close_ledgers(state, &req.params).await,
         unknown => {
             warn!("soroban-fork: unsupported RPC method: {unknown}");
@@ -802,6 +804,230 @@ async fn handle_fork_set_code(
         ok: true,
         hash: hex_lower(&hash_bytes),
         latest_ledger: latest.sequence,
+    };
+    serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+}
+
+/// `fork_setBalance` — Foundry's `deal()`-equivalent for Stellar
+/// Classic assets. Sets the balance of an account for a given
+/// asset (Native XLM or Credit AlphaNum4/12); auto-creates the
+/// underlying entry if it doesn't exist yet.
+///
+/// Two paths:
+/// - **Native (XLM)**: balance lives on `AccountEntry`. We
+///   read-modify-write to preserve `seq_num`, `signers`, `flags`,
+///   etc. — only `balance` changes. If the account doesn't exist
+///   yet, create one with sensible defaults (master threshold 1,
+///   no signers, no home domain).
+/// - **Credit (USDC etc.)**: balance lives on `TrustLineEntry`
+///   keyed by `(account, asset)`. Same RMW pattern. Auto-created
+///   trustlines get `flags = AUTHORIZED`, `limit = i64::MAX` —
+///   the post-`ChangeTrust` shape.
+///
+/// `last_modified_ledger_seq` is set to the fork's current
+/// reported ledger so the entry's metadata isn't a lie. Real
+/// Stellar would have closed a ledger to apply this; the fork
+/// hasn't, but the field can't be left at 0 without misleading
+/// any client that uses it as a freshness signal.
+///
+/// Soroban-native token mint/burn (the SAC `mint(to, amount)`
+/// invocation path) is deferred to v0.8.5 — it requires going
+/// through `sendTransaction` with trust-mode auth, plus a
+/// `balance(to)` query first to compute the delta. Bigger scope
+/// than the direct ledger-entry write here.
+async fn handle_fork_set_balance(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    use soroban_env_host::xdr::{
+        AccountEntry, AccountEntryExt, AccountId, AlphaNum12, AlphaNum4, AssetCode12, AssetCode4,
+        LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyAccount,
+        LedgerKeyTrustLine, PublicKey, SequenceNumber, Thresholds, TrustLineAsset, TrustLineEntry,
+        TrustLineEntryExt, Uint256,
+    };
+
+    let parsed: SetBalanceParams = serde_json::from_value(params.clone())
+        .map_err(|e| JsonRpcError::invalid_params(format!("fork_setBalance params: {e}")))?;
+
+    // ---- Account strkey -> AccountId ----
+    let account_strkey =
+        stellar_strkey::ed25519::PublicKey::from_string(&parsed.account).map_err(|e| {
+            JsonRpcError::invalid_params(format!("account: not a valid G... strkey: {e}"))
+        })?;
+    let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_strkey.0)));
+
+    // ---- Amount string -> i64 ----
+    let amount: i64 = parsed.amount.parse().map_err(|e| {
+        JsonRpcError::invalid_params(format!(
+            "amount: not a valid i64 decimal string ({e}): {:?}",
+            parsed.amount
+        ))
+    })?;
+    if amount < 0 {
+        return Err(JsonRpcError::invalid_params(format!(
+            "amount: must be >= 0, got {amount}"
+        )));
+    }
+
+    // Build the LedgerKey for the entry we're going to write.
+    // Native uses LedgerKey::Account; credit uses LedgerKey::Trustline.
+    // For credit we also need the parsed TrustLineAsset for both the
+    // key and (on auto-create) the new entry.
+    let asset_wire = parsed.asset.unwrap_or(AssetWire::Native(
+        crate::server::types::NativeMarker::Native,
+    ));
+    let (lookup_key, trustline_asset_for_create) = match &asset_wire {
+        AssetWire::Native(_) => (
+            LedgerKey::Account(LedgerKeyAccount {
+                account_id: account_id.clone(),
+            }),
+            None,
+        ),
+        AssetWire::Credit { code, issuer } => {
+            let issuer_strkey =
+                stellar_strkey::ed25519::PublicKey::from_string(issuer).map_err(|e| {
+                    JsonRpcError::invalid_params(format!(
+                        "asset.issuer: not a valid G... strkey: {e}"
+                    ))
+                })?;
+            let issuer_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(issuer_strkey.0)));
+            let trustline_asset = match code.len() {
+                0 => {
+                    return Err(JsonRpcError::invalid_params(
+                        "asset.code: must be 1-12 chars, got empty",
+                    ));
+                }
+                1..=4 => {
+                    let mut bytes = [0u8; 4];
+                    bytes[..code.len()].copy_from_slice(code.as_bytes());
+                    TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                        asset_code: AssetCode4(bytes),
+                        issuer: issuer_id,
+                    })
+                }
+                5..=12 => {
+                    let mut bytes = [0u8; 12];
+                    bytes[..code.len()].copy_from_slice(code.as_bytes());
+                    TrustLineAsset::CreditAlphanum12(AlphaNum12 {
+                        asset_code: AssetCode12(bytes),
+                        issuer: issuer_id,
+                    })
+                }
+                len => {
+                    return Err(JsonRpcError::invalid_params(format!(
+                        "asset.code: must be 1-12 chars, got {len}"
+                    )));
+                }
+            };
+            (
+                LedgerKey::Trustline(LedgerKeyTrustLine {
+                    account_id: account_id.clone(),
+                    asset: trustline_asset.clone(),
+                }),
+                Some(trustline_asset),
+            )
+        }
+    };
+
+    // ---- Read existing entry (if any) ----
+    let existing = state
+        .actor
+        .send(|tx| Command::GetLedgerEntries {
+            keys: vec![lookup_key.clone()],
+            reply: tx,
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    let existing_entry = existing.entries.into_iter().next().flatten();
+
+    // ---- Build the new entry: RMW if exists, default if not ----
+    let new_entry = match (asset_wire, existing_entry, trustline_asset_for_create) {
+        // Native, exists: RMW the AccountEntry's balance.
+        (AssetWire::Native(_), Some((_, mut entry, _)), _) => {
+            match &mut entry.data {
+                LedgerEntryData::Account(account) => account.balance = amount,
+                other => {
+                    return Err(JsonRpcError::internal_error(format!(
+                        "expected Account entry under Account key, got {other:?} \
+                         (cache corruption or LedgerKey/LedgerEntry shape mismatch)"
+                    )));
+                }
+            }
+            entry.last_modified_ledger_seq = existing.latest_ledger;
+            entry
+        }
+        // Native, doesn't exist: synthesise a default AccountEntry.
+        (AssetWire::Native(_), None, _) => LedgerEntry {
+            last_modified_ledger_seq: existing.latest_ledger,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: amount,
+                // Mimic test_accounts: ledger_seq << 32 so the seq_num
+                // looks like a real Stellar tx-seq encoding.
+                seq_num: SequenceNumber((existing.latest_ledger as i64) << 32),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: Default::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: Default::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        },
+        // Credit, exists: RMW the TrustLineEntry's balance.
+        (AssetWire::Credit { .. }, Some((_, mut entry, _)), _) => {
+            match &mut entry.data {
+                LedgerEntryData::Trustline(tl) => tl.balance = amount,
+                other => {
+                    return Err(JsonRpcError::internal_error(format!(
+                        "expected Trustline entry under Trustline key, got {other:?} \
+                         (cache corruption or LedgerKey/LedgerEntry shape mismatch)"
+                    )));
+                }
+            }
+            entry.last_modified_ledger_seq = existing.latest_ledger;
+            entry
+        }
+        // Credit, doesn't exist: synthesise a default TrustLineEntry
+        // with AUTHORIZED flag + max limit (post-ChangeTrust shape).
+        (AssetWire::Credit { .. }, None, Some(asset)) => LedgerEntry {
+            last_modified_ledger_seq: existing.latest_ledger,
+            data: LedgerEntryData::Trustline(TrustLineEntry {
+                account_id: account_id.clone(),
+                asset,
+                balance: amount,
+                limit: i64::MAX,
+                flags: 1, // AUTHORIZED_FLAG
+                ext: TrustLineEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        },
+        // Should be unreachable (Credit always has a Some(asset)),
+        // but the match has to be total.
+        (AssetWire::Credit { .. }, None, None) => {
+            return Err(JsonRpcError::internal_error(
+                "internal: credit asset without trustline-asset construction (bug)",
+            ));
+        }
+    };
+
+    state
+        .actor
+        .send(|tx| Command::SetLedgerEntry {
+            key: lookup_key,
+            entry: new_entry,
+            // Account/Trustline entries don't carry TTL hints.
+            live_until: None,
+            reply: tx,
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    let body = SetBalanceResponse {
+        ok: true,
+        latest_ledger: existing.latest_ledger,
     };
     serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
 }

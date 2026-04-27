@@ -1417,6 +1417,217 @@ async fn server_fork_set_code_uploads_wasm() {
     running.shutdown().await.expect("shutdown");
 }
 
+/// `fork_setBalance` covers Foundry's `deal()`-equivalent for
+/// Stellar Classic assets. This test exercises three paths:
+/// 1. **Native RMW**: rewrite the test account's XLM balance
+///    (preserves `seq_num` and other AccountEntry fields).
+/// 2. **Credit RMW**: rewrite the test account's pre-existing
+///    USDC trustline balance to non-zero.
+/// 3. **Credit auto-create**: give the test account some BLND —
+///    no pre-created trustline for that asset — and verify the
+///    handler synthesises a new TrustLineEntry with
+///    `flags = AUTHORIZED`, `limit = i64::MAX`.
+///
+/// This is the headline test for the v0.8.4 deal-equivalent
+/// surface. It exercises every branch of the
+/// `(asset_wire, existing_entry)` match in the handler.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
+async fn server_fork_set_balance_native_credit_and_auto_create() {
+    use soroban_env_host::xdr::LedgerEntryData;
+    use soroban_fork::test_accounts;
+
+    /// 7-decimal scaling shared between XLM and most Stellar Classic
+    /// assets (USDC, BLND). `1 unit * UNIT == 10_000_000 stroops`.
+    const UNIT: i64 = 10_000_000;
+
+    /// Mainnet USDC issuer (Circle).
+    const USDC_ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+
+    let (url, running) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Generate two test accounts. [0] is the recipient under test;
+    // [1] doubles as a deterministic-but-valid issuer strkey for
+    // the BLND auto-create branch. We don't need that issuer to
+    // exist upstream — the trustline lookup on a never-fetched key
+    // returns None and the handler synthesises the entry locally.
+    let test_accounts = test_accounts::generate(2);
+    let account_0 = &test_accounts[0];
+    let account_strkey = account_0.account_strkey();
+    let dummy_blnd_issuer = test_accounts[1].account_strkey();
+
+    // ---- Phase 1: Native RMW ----
+    // Pre-funded test accounts ship with 100K XLM = 1_000_000_000_000 stroops.
+    // Bump to 500K and verify the balance changed without disturbing
+    // other AccountEntry fields.
+    let new_xlm: i64 = 500_000 * UNIT;
+    let resp = jsonrpc_call(
+        &client,
+        &url,
+        "fork_setBalance",
+        serde_json::json!({
+            "account": account_strkey,
+            "amount": new_xlm.to_string(),
+            // asset omitted -> defaults to "native"
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], true, "native RMW must succeed");
+
+    // Read back the AccountEntry and verify the balance.
+    let key = LedgerKey::Account(soroban_env_host::xdr::LedgerKeyAccount {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            account_0.public_key,
+        ))),
+    });
+    let key_b64 = BASE64.encode(key.to_xdr(Limits::none()).unwrap());
+    let read = jsonrpc_call(
+        &client,
+        &url,
+        "getLedgerEntries",
+        serde_json::json!({ "keys": [key_b64] }),
+    )
+    .await;
+    let entries = read["result"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "AccountEntry must exist post-set");
+    let returned_xdr = entries[0]["xdr"].as_str().unwrap();
+    let returned_bytes = BASE64.decode(returned_xdr).unwrap();
+    let returned_data = LedgerEntryData::from_xdr(returned_bytes, Limits::none()).expect("decode");
+    let returned_account = match returned_data {
+        LedgerEntryData::Account(a) => a,
+        other => panic!("expected Account, got {other:?}"),
+    };
+    assert_eq!(
+        returned_account.balance, new_xlm,
+        "native balance must match the value we wrote"
+    );
+
+    // ---- Phase 2: Credit RMW (existing USDC trustline) ----
+    // Test accounts ship with USDC trustlines pre-created (balance 0).
+    // Set to 250 USDC.
+    let new_usdc: i64 = 250 * UNIT;
+    let resp = jsonrpc_call(
+        &client,
+        &url,
+        "fork_setBalance",
+        serde_json::json!({
+            "account": account_strkey,
+            "amount": new_usdc.to_string(),
+            "asset": { "code": "USDC", "issuer": USDC_ISSUER },
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["ok"], true,
+        "credit RMW (existing trustline) must succeed"
+    );
+
+    let usdc_balance =
+        read_trustline_balance(&client, &url, &account_0.public_key, "USDC", USDC_ISSUER).await;
+    assert_eq!(usdc_balance, new_usdc, "USDC trustline balance must match");
+
+    // ---- Phase 3: Credit auto-create (no pre-existing BLND trustline) ----
+    let new_blnd: i64 = 1_000 * UNIT;
+    let resp = jsonrpc_call(
+        &client,
+        &url,
+        "fork_setBalance",
+        serde_json::json!({
+            "account": account_strkey,
+            "amount": new_blnd.to_string(),
+            "asset": { "code": "BLND", "issuer": dummy_blnd_issuer.as_str() },
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["ok"], true,
+        "credit auto-create must succeed even without pre-existing trustline"
+    );
+
+    let blnd_balance = read_trustline_balance(
+        &client,
+        &url,
+        &account_0.public_key,
+        "BLND",
+        dummy_blnd_issuer.as_str(),
+    )
+    .await;
+    assert_eq!(
+        blnd_balance, new_blnd,
+        "auto-created BLND trustline must hold the balance we set"
+    );
+
+    running.shutdown().await.expect("shutdown");
+}
+
+/// Helper for the `fork_setBalance` test: read back a TrustLineEntry's
+/// balance for `(account, asset_code, issuer_strkey)`. Builds the
+/// LedgerKey, posts `getLedgerEntries`, decodes the response. Asserts
+/// the entry exists — failure means the prior write didn't land.
+async fn read_trustline_balance(
+    client: &reqwest::Client,
+    url: &str,
+    account_pk: &[u8; 32],
+    code: &str,
+    issuer_strkey: &str,
+) -> i64 {
+    use soroban_env_host::xdr::{
+        AlphaNum12, AlphaNum4, AssetCode12, AssetCode4, LedgerEntryData, LedgerKeyTrustLine,
+        TrustLineAsset,
+    };
+
+    let issuer_pk: stellar_strkey::ed25519::PublicKey =
+        issuer_strkey.parse().expect("valid issuer strkey");
+    let issuer_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(issuer_pk.0)));
+
+    let asset = match code.len() {
+        1..=4 => {
+            let mut bytes = [0u8; 4];
+            bytes[..code.len()].copy_from_slice(code.as_bytes());
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(bytes),
+                issuer: issuer_id,
+            })
+        }
+        5..=12 => {
+            let mut bytes = [0u8; 12];
+            bytes[..code.len()].copy_from_slice(code.as_bytes());
+            TrustLineAsset::CreditAlphanum12(AlphaNum12 {
+                asset_code: AssetCode12(bytes),
+                issuer: issuer_id,
+            })
+        }
+        len => panic!("invalid asset code length {len}"),
+    };
+
+    let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*account_pk))),
+        asset,
+    });
+    let key_b64 = BASE64.encode(key.to_xdr(Limits::none()).unwrap());
+    let read = jsonrpc_call(
+        client,
+        url,
+        "getLedgerEntries",
+        serde_json::json!({ "keys": [key_b64] }),
+    )
+    .await;
+    let entries = read["result"]["entries"].as_array().expect("entries array");
+    assert_eq!(
+        entries.len(),
+        1,
+        "trustline entry for {code} must exist after fork_setBalance"
+    );
+    let returned_xdr = entries[0]["xdr"].as_str().unwrap();
+    let returned_bytes = BASE64.decode(returned_xdr).unwrap();
+    let returned_data = LedgerEntryData::from_xdr(returned_bytes, Limits::none()).expect("decode");
+    match returned_data {
+        LedgerEntryData::Trustline(tl) => tl.balance,
+        other => panic!("expected Trustline entry, got {other:?}"),
+    }
+}
+
 // `dummy_source_account` is referenced from a docstring example only;
 // silence the unused-but-needed-as-sample warning.
 #[allow(dead_code)]
