@@ -349,6 +349,10 @@ cargo run --release --example blend_lending
 
 # What's my fill price market-selling 1M XLM into Phoenix?
 cargo run --release --example phoenix_slippage
+
+# Phoenix vs Soroswap on the same XLM/USDC trade — how big is the
+# cross-DEX price gap right now?
+cargo run --release --example cross_dex_arbitrage
 ```
 
 `MAINNET_RPC_URL` overrides the upstream RPC. Each example prints
