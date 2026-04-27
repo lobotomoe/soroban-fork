@@ -132,13 +132,14 @@ impl ForkedEnv {
     /// Advance the ledger sequence and timestamp that the `Env` reports
     /// to contracts.
     ///
-    /// **Not block production.** Unlike Anvil's `evm_mine`, this does
-    /// not process any pending state — there are no pending transactions
-    /// in this model, and no contract code runs as a side effect of the
-    /// warp. It only changes what `env.ledger().sequence_number()` and
-    /// `env.ledger().timestamp()` return on subsequent reads. Use this
-    /// when contract logic conditionally branches on ledger time
-    /// (vesting cliffs, auction windows, oracle staleness checks).
+    /// **Not ledger close.** Unlike a real Stellar ledger close, this
+    /// does not process any pending state — there are no pending
+    /// transactions in this model, and no contract code runs as a side
+    /// effect of the warp. It only changes what
+    /// `env.ledger().sequence_number()` and `env.ledger().timestamp()`
+    /// return on subsequent reads. Use this when contract logic
+    /// conditionally branches on ledger time (vesting cliffs, auction
+    /// windows, oracle staleness checks).
     ///
     /// **TTL caveat.** Bumping the sequence past a cached entry's
     /// `live_until_ledger_seq` does not automatically simulate Soroban's
@@ -150,8 +151,8 @@ impl ForkedEnv {
         // Saturating arithmetic: pre-v0.8 these `+=` ops were
         // reachable only from lib-mode test code, where an overflow
         // panic was a fine signal of "your test math is wrong". v0.8
-        // wires `warp` through `anvil_mine` over JSON-RPC, so any
-        // client can request unbounded advances; saturating keeps
+        // wires `warp` through `fork_closeLedgers` over JSON-RPC, so
+        // any client can request unbounded advances; saturating keeps
         // wire-driven misuse from panicking the worker thread (which
         // would kill the whole server). The saturated values are
         // already past any meaningful real-Stellar ledger horizon, so
@@ -244,10 +245,10 @@ impl ForkedEnv {
 
     /// Ledger sequence the forked Env *currently* reports — reads
     /// the live value out of [`Env::ledger`] so any [`Self::warp`] /
-    /// [`Self::warp_ledger`] / `anvil_mine` calls are reflected
+    /// [`Self::warp_ledger`] / `fork_closeLedgers` calls are reflected
     /// immediately. At fork build the value matches the upstream
-    /// RPC's latest (or [`ForkConfig::at_ledger`]); cheatcodes that
-    /// advance time move it forward from there.
+    /// RPC's latest (or [`ForkConfig::at_ledger`]); fork-mode
+    /// extensions that advance time move it forward from there.
     ///
     /// The fork-point sequence (used as cache metadata in
     /// [`Self::save_cache`]) is preserved separately on the
@@ -258,7 +259,7 @@ impl ForkedEnv {
     }
 
     /// Close-time the forked Env *currently* reports (Unix seconds).
-    /// Live reading from [`Env::ledger`] — `anvil_mine` and
+    /// Live reading from [`Env::ledger`] — `fork_closeLedgers` and
     /// [`Self::warp_time`] move it; the fork-point timestamp is
     /// preserved separately for cache provenance.
     pub fn ledger_close_time(&self) -> u64 {
@@ -423,7 +424,7 @@ pub struct ForkConfig {
     rpc_config: RpcConfig,
     tracing: bool,
     /// Number of pre-funded test accounts to mint at build time.
-    /// `0` disables them. Default: 10 (Anvil parity).
+    /// `0` disables them. Default: 10.
     test_account_count: usize,
     /// Trustlines to pre-create for each test account against
     /// Stellar-Classic-issued assets. Required so that SAC `transfer`
@@ -562,10 +563,10 @@ impl ForkConfig {
     }
 
     /// Number of pre-funded deterministic test accounts to mint at
-    /// fork-build time. Each gets ~100K XLM. Default: 10
-    /// (Anvil-equivalent UX). Set to `0` to skip account
-    /// pre-population — useful when the only thing you'll do with
-    /// the fork is read mainnet state, never construct envelopes.
+    /// fork-build time. Each gets ~100K XLM. Default: 10. Set to `0`
+    /// to skip account pre-population — useful when the only thing
+    /// you'll do with the fork is read mainnet state, never construct
+    /// envelopes.
     ///
     /// The accounts are deterministic: the same seed string
     /// produces the same keypairs across runs and across machines,

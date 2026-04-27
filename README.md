@@ -12,7 +12,7 @@ When a test reads a ledger entry that isn't in the local cache, `soroban-fork` f
 
 ```toml
 [dev-dependencies]
-soroban-fork = "0.5"
+soroban-fork = "0.8"
 ```
 
 ## Usage
@@ -209,10 +209,9 @@ understands the spec.
 ### Pre-funded test accounts *(new in v0.7)*
 
 The fork mints **10 deterministic test accounts** at build time, each
-with 100K XLM and a USDC trustline ready to receive — Anvil's "10
-accounts × 10K ETH" UX for Stellar. Same seed produces the same
-accounts every run, so test code can hard-code addresses by index.
-The CLI prints them on startup:
+with 100K XLM and a USDC trustline ready to receive. Same seed
+produces the same accounts every run, so test code can hard-code
+addresses by index. The CLI prints them on startup:
 
 ```
 soroban-fork v0.7
@@ -240,7 +239,8 @@ override via `ForkConfig::test_account_trustlines(vec![...])`. The
 trustlines are written with `flags = AUTHORIZED_FLAG`, `limit = i64::MAX` —
 shape-equivalent to running `ChangeTrust` then having the issuer
 authorize, just bootstrapped at build time. Auth runs in trust mode
-(`Recording(false)`), Anvil-equivalent for tests.
+(`Recording(false)`) so unsigned envelopes from test code apply
+without ceremony.
 
 Override count via `--accounts N` (set to `0` to disable). For
 library users, `ForkConfig::test_account_count(n).build()` exposes
@@ -263,7 +263,7 @@ Soroswap, etc.) follow the same pattern: dependencies the deployed
 contract reaches into get lazy-fetched from mainnet and cached
 locally.
 
-### Methods supported in v0.8
+### Methods supported in v0.8.1
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -290,48 +290,58 @@ locally.
   - `latestLedger` — fork's reported ledger
 - **`sendTransaction`** *(new in v0.6)* — applies the host invocation's
   writes back to the snapshot source so subsequent reads see them.
-  Auth runs in trust mode (`Recording(false)`) — same UX as Anvil's
-  default for EVM tests, so unsigned envelopes from test code work
-  without ceremony. Returns `status` (`"SUCCESS"` / `"ERROR"`),
-  `hash` (sha256 of the envelope), `appliedChanges` (number of
-  `LedgerEntryChange`s written), and the original envelope echo.
+  Auth runs in trust mode (`Recording(false)`) so unsigned envelopes
+  from test code apply without ceremony. Returns `status`
+  (`"SUCCESS"` / `"ERROR"`), `hash` (sha256 of the envelope),
+  `appliedChanges` (number of `LedgerEntryChange`s written), and
+  the original envelope echo.
 - **`getTransaction`** *(new in v0.6)* — receipt lookup by hash.
   Returns `"SUCCESS"` / `"FAILED"` / `"NOT_FOUND"`, plus the original
   envelope, the host function's `ScVal` return value, and the
   applied-changes count when found.
-- **`anvil_setLedgerEntry`** *(new in v0.8)* — Anvil-style cheatcode:
-  force-write a base64-XDR `LedgerEntry` to any `LedgerKey` directly
-  in the snapshot source, bypassing host-level checks. Load-bearing
-  primitive for stress-test scenarios — oracle price manipulation,
-  force-set token balances, replace contract code, all reduce to
-  this one entry write.
-- **`anvil_mine`** *(new in v0.8)* — advance the fork's reported
-  ledger sequence by `blocks` (default 1) and bump close-time by
-  `timestampAdvanceSeconds` (default `blocks * 5` — Stellar's
-  average close rate). Pushes time-sensitive contract logic
-  (vesting cliffs, oracle staleness) past thresholds without
-  orchestrating real transactions.
 
-### What v0.8 server does NOT support
+#### Fork-mode extensions (`fork_*`)
+
+Non-standard methods, only available against soroban-fork. The
+`fork_` prefix marks the namespace boundary explicitly so a
+client can distinguish "this works against any Stellar RPC" from
+"this only works against the fork."
+
+- **`fork_setLedgerEntry`** *(new in v0.8, renamed from `anvil_setLedgerEntry` in v0.8.1)* —
+  force-write a base64-XDR `LedgerEntry` to any `LedgerKey`
+  directly in the snapshot source, bypassing host-level checks.
+  Load-bearing primitive for stress-test scenarios — oracle price
+  manipulation, force-set token balances, replace contract code,
+  all reduce to this one entry write.
+- **`fork_closeLedgers`** *(new in v0.8, renamed from `anvil_mine` in v0.8.1)* —
+  close `ledgers` ledgers (default 1) and bump close-time by
+  `timestampAdvanceSeconds` (default `ledgers * 5` — Stellar's
+  average close rate). Stellar's verb is *closing* a ledger;
+  pushes time-sensitive contract logic (vesting cliffs, oracle
+  staleness) past thresholds without orchestrating real
+  transactions.
+
+### What v0.8.1 server does NOT support
 
 Listed up front so nothing surprises you:
 
 - **`getEvents`** — historical event filtering. Diagnostic events
   emitted during simulation are reachable via `simulateTransaction`'s
   response.
-- **Ergonomic `anvil_*` wrappers** — `setBalance`, `setStorage`,
+- **Ergonomic `fork_*` wrappers** — `setBalance`, `setStorage`,
   `setCode`, `setNonce`, `impersonate`. The primitive
-  `anvil_setLedgerEntry` covers all of these once the client
+  `fork_setLedgerEntry` covers all of these once the client
   constructs the right XDR; sugar wrappers are a v0.8.x followup.
-- **`anvil_snapshot` / `anvil_revert`** — saved-state checkpoints.
+- **`fork_snapshot` / `fork_revert`** — saved-state checkpoints.
   Scoped to v0.9 (the `Rc<HostImpl>` snapshot model needs its own
   design pass — either a journaling layer over `RpcSnapshotSource`
   or a clone-on-snapshot of the entire cache map).
-- **Block production by `sendTransaction` side-effect** — each send
+- **Ledger close as a `sendTransaction` side-effect** — each send
   applies its writes and bumps the source's `seq_num`, but does
   *not* automatically advance `env.ledger().sequence_number()`. Use
-  `anvil_mine` (or `env.warp(...)` from lib mode) to push the
-  ledger forward. Auto-mine on send is a v0.8.x ergonomic followup.
+  `fork_closeLedgers` (or `env.warp(...)` from lib mode) to push
+  the ledger forward. Auto-close on send is a v0.8.x ergonomic
+  followup.
 - **`resultMetaXdr` on `getTransaction`** — Stellar's
   `TransactionMeta::V3` carries state-change deltas in a
   Stellar-core-XDR-heavy shape; v0.6 returns `returnValueXdr` and
@@ -343,8 +353,7 @@ axum HTTP handlers run on a multi-thread tokio runtime; commands flow
 through a bounded `mpsc` channel to one OS thread that owns the
 `ForkedEnv`. The SDK's `Env` contains `Rc<HostImpl>` and is `!Send`, so
 it can't live behind `Arc<RwLock>` — single-thread ownership with
-explicit messaging is the load-bearing constraint of this design. Same
-trade-off Foundry's Anvil makes for the EVM.
+explicit messaging is the load-bearing constraint of this design.
 
 ```
 [HTTP handler 1]──┐
@@ -517,7 +526,7 @@ that were lazy-fetched during the test. This means the second run of a test with
 
 What soroban-fork does NOT yet do — listed up front so nothing surprises you in production:
 
-- ~~**No `sendTransaction` / state mutation through RPC.**~~ *(closed in v0.6.)* Server-mode `sendTransaction` applies writes back to the snapshot source so subsequent reads see them; `getTransaction` retrieves receipts by hash. *(closed in v0.7:)* the fork now mints 10 pre-funded test accounts at build, auto-increments `seq_num` after every successful send, and accepts `UploadContractWasm` + `CreateContract` host functions — full deploy-then-call workflow against forked mainnet works. `anvil_*` cheatcodes (impersonate / setBalance / setCode / setStorage) are scoped to v0.8; `anvil_snapshot` / `anvil_revert` to v0.9.
+- ~~**No `sendTransaction` / state mutation through RPC.**~~ *(closed in v0.6.)* Server-mode `sendTransaction` applies writes back to the snapshot source so subsequent reads see them; `getTransaction` retrieves receipts by hash. *(closed in v0.7:)* the fork now mints 10 pre-funded test accounts at build, auto-increments `seq_num` after every successful send, and accepts `UploadContractWasm` + `CreateContract` host functions — full deploy-then-call workflow against forked mainnet works. *(closed in v0.8:)* `fork_setLedgerEntry` and `fork_closeLedgers` extensions land — force-write any `LedgerEntry` and advance the reported ledger directly. Ergonomic `fork_*` wrappers (impersonate / setBalance / setCode / setStorage) are a v0.8.x followup; `fork_snapshot` / `fork_revert` are scoped to v0.9.
 - **No TTL / archival simulation.** Soroban entries carry a `live_until_ledger_seq`; on real mainnet they become archived past that ledger and need a `RestoreFootprint` operation. We track `live_until` in the cache but do not yet model expiry — bumping `env.ledger()` past an entry's `live_until` will not flip it to archived. Tests that depend on TTL-expiry semantics will see false-positives.
 - **No historical state.** `at_ledger(N)` shifts only what `env.ledger().sequence_number()` reports; the actual ledger entries are always fetched at the RPC's *current* latest. Pin to a specific ledger only when paired with `cache_file` for reproducibility, not when expecting historical state.
 - **Tracing renders structure, not metering.** `env.trace()` captures the call tree with decoded args and return values. It does **not** yet render per-frame gas / cost units, contract events, or decoded `HostError` reasons. (Diagnostic events from the host carry call structure but not metering numbers; metering is planned. Server-mode `simulateTransaction` does return real `cost.cpuInsns` separately.)

@@ -306,9 +306,10 @@ async fn server_returns_method_not_found_for_unknown() {
 ///
 /// Auth note: the worker runs `RecordingInvocationAuthMode::Recording(false)`,
 /// which bypasses non-root authorizations. The SAC's admin
-/// `require_auth` for `mint` is recorded but not enforced — same UX
-/// as Anvil's default trust mode. Real `sendTransaction` against
-/// stellar-rpc would reject this without a signed admin envelope.
+/// `require_auth` for `mint` is recorded but not enforced — fork
+/// trust mode applies the invocation regardless of signatures.
+/// Real `sendTransaction` against stellar-rpc would reject this
+/// without a signed admin envelope.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
 async fn server_send_transaction_persists_state() {
@@ -860,8 +861,8 @@ fn build_upload_envelope(wasm: &[u8], source_pk: &[u8; 32]) -> String {
 }
 
 /// Real-world cross-protocol scenario: a pre-funded test account
-/// (the "Anvil-equivalent EOA") swaps live mainnet XLM for USDC on
-/// Phoenix DEX through a single `sendTransaction`. After the swap
+/// swaps live mainnet XLM for USDC on Phoenix DEX through a single
+/// `sendTransaction`. After the swap
 /// alice's Trustline(USDC) balance must be positive — proving the
 /// fork's pre-funded account, USDC trustline, and `apply_changes`
 /// pipeline all line up to support the full DEX flow that any
@@ -1028,18 +1029,18 @@ fn parse_trustline_balance(item: &Value) -> i64 {
     }
 }
 
-/// `anvil_setLedgerEntry` writes an arbitrary `LedgerEntry` directly
+/// `fork_setLedgerEntry` writes an arbitrary `LedgerEntry` directly
 /// into the snapshot source. Round-trip verifies that:
 /// 1. The wire decode + worker dispatch + cache write actually happen.
 /// 2. The next `getLedgerEntries` for that key returns what we wrote.
 ///
-/// Demonstrates the load-bearing primitive Anvil's `setStorageAt` /
-/// `setBalance` cheatcodes are built on. We use a `ContractData`
-/// entry so the test stresses the most common stress-test case
-/// (oracle / contract-storage manipulation).
+/// Demonstrates the load-bearing primitive every fork-mode state
+/// override (oracle prices, token balances, contract code) reduces
+/// to. We use a `ContractData` entry so the test stresses the most
+/// common stress-test case (oracle / contract-storage manipulation).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
-async fn server_anvil_set_ledger_entry_round_trips() {
+async fn server_fork_set_ledger_entry_round_trips() {
     use soroban_env_host::xdr::{ContractDataEntry, LedgerEntryData, LedgerEntryExt};
 
     let (url, running) = start_test_server().await;
@@ -1072,8 +1073,8 @@ async fn server_anvil_set_ledger_entry_round_trips() {
     );
 
     // Build the entry we want to write: ContractData with an
-    // `i128(42_424_242)` value. Anvil-style raw write — we don't
-    // care that the host wouldn't normally produce this entry.
+    // `i128(42_424_242)` value. Raw write — we don't care that the
+    // host wouldn't normally produce this entry.
     let target_value = ScVal::I128(soroban_env_host::xdr::Int128Parts {
         hi: 0,
         lo: 42_424_242,
@@ -1091,11 +1092,11 @@ async fn server_anvil_set_ledger_entry_round_trips() {
     };
     let entry_b64 = BASE64.encode(entry.to_xdr(Limits::none()).unwrap());
 
-    // Cheatcode write.
+    // Fork-mode write.
     let set_resp = jsonrpc_call(
         &client,
         &url,
-        "anvil_setLedgerEntry",
+        "fork_setLedgerEntry",
         serde_json::json!({
             "key": key_b64,
             "entry": entry_b64,
@@ -1119,7 +1120,7 @@ async fn server_anvil_set_ledger_entry_round_trips() {
     assert_eq!(
         entries.len(),
         1,
-        "the cheatcode-written entry must be visible"
+        "the fork-written entry must be visible"
     );
 
     // Decode the returned entry's value and confirm exact match.
@@ -1138,32 +1139,32 @@ async fn server_anvil_set_ledger_entry_round_trips() {
     running.shutdown().await.expect("shutdown");
 }
 
-/// `anvil_mine` advances the fork's reported ledger sequence and
-/// close-time. After mining, `getLatestLedger` reflects the new
+/// `fork_closeLedgers` advances the fork's reported ledger sequence
+/// and close-time. After closing, `getLatestLedger` reflects the new
 /// values — proving that time-sensitive contract logic (vesting,
-/// oracle staleness) can be pushed past thresholds without
-/// sending real transactions.
+/// oracle staleness) can be pushed past thresholds without sending
+/// real transactions.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
-async fn server_anvil_mine_advances_ledger() {
+async fn server_fork_close_ledgers_advances_ledger() {
     let (url, running) = start_test_server().await;
     let client = reqwest::Client::new();
 
     let before = jsonrpc_call(&client, &url, "getLatestLedger", Value::Null).await;
     let before_seq = before["result"]["sequence"].as_u64().expect("sequence") as u32;
 
-    // Mine 100 blocks with default 5s/block timestamp advance.
-    let mine_resp = jsonrpc_call(
+    // Close 100 ledgers with default 5s/ledger timestamp advance.
+    let close_resp = jsonrpc_call(
         &client,
         &url,
-        "anvil_mine",
-        serde_json::json!({ "blocks": 100u32 }),
+        "fork_closeLedgers",
+        serde_json::json!({ "ledgers": 100u32 }),
     )
     .await;
-    let new_seq: u32 = mine_resp["result"]["newSequence"]
+    let new_seq: u32 = close_resp["result"]["newSequence"]
         .as_u64()
         .expect("newSequence") as u32;
-    let new_close_time: u64 = mine_resp["result"]["newCloseTime"]
+    let new_close_time: u64 = close_resp["result"]["newCloseTime"]
         .as_str()
         .expect("newCloseTime is string")
         .parse()
@@ -1172,32 +1173,32 @@ async fn server_anvil_mine_advances_ledger() {
     assert_eq!(
         new_seq,
         before_seq + 100,
-        "mine should advance the ledger by exactly the requested block count"
+        "fork_closeLedgers should advance the ledger by exactly the requested count"
     );
     assert!(
         new_close_time > 0,
         "close time must be present and non-zero"
     );
 
-    // Confirm the next getLatestLedger sees the bump (i.e. mine
+    // Confirm the next getLatestLedger sees the bump (i.e. close
     // wasn't a phantom — the env's live ledger info was actually
     // updated, not just the response synthesised).
     let after = jsonrpc_call(&client, &url, "getLatestLedger", Value::Null).await;
     let after_seq = after["result"]["sequence"].as_u64().expect("sequence") as u32;
     assert_eq!(
         after_seq, new_seq,
-        "subsequent getLatestLedger must agree with anvil_mine's reported new_sequence"
+        "subsequent getLatestLedger must agree with fork_closeLedgers' reported new_sequence"
     );
 
-    // Mine with no params (default: 1 block, +5s) should advance by 1.
-    let one_more = jsonrpc_call(&client, &url, "anvil_mine", Value::Null).await;
+    // Close with no params (default: 1 ledger, +5s) should advance by 1.
+    let one_more = jsonrpc_call(&client, &url, "fork_closeLedgers", Value::Null).await;
     let after_one_more: u32 = one_more["result"]["newSequence"]
         .as_u64()
         .expect("newSequence") as u32;
     assert_eq!(
         after_one_more,
         new_seq + 1,
-        "no-arg anvil_mine should default to 1 block"
+        "no-arg fork_closeLedgers should default to 1 ledger"
     );
 
     running.shutdown().await.expect("shutdown");

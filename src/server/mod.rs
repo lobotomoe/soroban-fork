@@ -1,4 +1,4 @@
-//! JSON-RPC server mode — Anvil-style fork RPC for Stellar.
+//! JSON-RPC server mode — Stellar Soroban fork RPC.
 //!
 //! When enabled via the `server` cargo feature, this module exposes a
 //! JSON-RPC HTTP server that speaks the Stellar Soroban RPC dialect, so
@@ -37,9 +37,11 @@
 //! - `getLedgerEntries` *(planned: same release)*
 //! - `simulateTransaction` *(planned: same release)*
 //!
-//! Deferred to v0.6:
-//! - `sendTransaction`, `getTransaction`, `getEvents`
-//! - `anvil_*` cheatcodes (snapshot, revert, impersonate, setBalance, setCode)
+//! Deferred to v0.6 / v0.8 / v0.9:
+//! - `sendTransaction`, `getTransaction` — landed in v0.6
+//! - `fork_setLedgerEntry`, `fork_closeLedgers` — landed in v0.8
+//! - `getEvents`, snapshot/revert, ergonomic wrappers (`setBalance`,
+//!   `setCode`, `impersonate`) — pending
 //!
 //! # Architecture
 //!

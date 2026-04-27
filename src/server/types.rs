@@ -378,10 +378,15 @@ pub(crate) struct GetTransactionParams {
 }
 
 // ---------------------------------------------------------------------------
-// anvil_* cheatcodes
+// fork_* extensions — non-standard methods, soroban-fork-specific.
+//
+// These are not part of the upstream Stellar RPC surface. The `fork_`
+// prefix marks the namespace boundary explicitly so a client can
+// distinguish "this works against any Stellar RPC" from "this only
+// works against soroban-fork."
 // ---------------------------------------------------------------------------
 
-/// `anvil_setLedgerEntry` request: a base64-XDR `LedgerKey` and the
+/// `fork_setLedgerEntry` request: a base64-XDR `LedgerKey` and the
 /// matching `LedgerEntry` to install in the snapshot source.
 ///
 /// `liveUntilLedgerSeq` is optional — used for entries that carry a
@@ -395,7 +400,7 @@ pub(crate) struct SetLedgerEntryParams {
     pub(crate) live_until_ledger_seq: Option<u32>,
 }
 
-/// `anvil_setLedgerEntry` response — just an ack with the latest
+/// `fork_setLedgerEntry` response — just an ack with the latest
 /// ledger so clients can sanity-check what they wrote against.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -404,24 +409,29 @@ pub(crate) struct SetLedgerEntryResponse {
     pub(crate) latest_ledger: u32,
 }
 
-/// `anvil_mine` request: how many ledgers to advance, and how much
-/// to bump close-time. Both default to "one ledger, +5s" — Stellar's
-/// average close rate, so the fork's reported time stays plausible
-/// without ceremony.
+/// `fork_closeLedgers` request: how many ledgers to close, and how
+/// much to bump close-time. Both default to "one ledger, +5s" —
+/// Stellar's average close rate, so the fork's reported time stays
+/// plausible without ceremony.
+///
+/// Stellar talks about *closing* ledgers (the network's term for
+/// finalising one ledger and moving on); this method advances the
+/// fork's reported sequence + timestamp the same way real ledger
+/// close does, without orchestrating a real consensus round.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct MineParams {
+pub(crate) struct CloseLedgersParams {
     #[serde(default)]
-    pub(crate) blocks: Option<u32>,
+    pub(crate) ledgers: Option<u32>,
     #[serde(default)]
     pub(crate) timestamp_advance_seconds: Option<u64>,
 }
 
-/// `anvil_mine` response — echoes the new ledger seq + close-time
-/// so callers don't need a follow-up `getLatestLedger`.
+/// `fork_closeLedgers` response — echoes the new ledger seq +
+/// close-time so callers don't need a follow-up `getLatestLedger`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct MineResponse {
+pub(crate) struct CloseLedgersResponse {
     pub(crate) new_sequence: u32,
     pub(crate) new_close_time: String,
 }

@@ -16,12 +16,12 @@ use soroban_env_host::xdr::{Limits, ReadXdr, WriteXdr};
 
 use crate::server::actor::{ActorHandle, Command, SimulationReply};
 use crate::server::types::{
-    GetLedgerEntriesParams, GetLedgerEntriesResponse, GetLedgersParams, GetLedgersResponse,
-    GetTransactionParams, GetTransactionResponse, HealthResponse, JsonRpcError, JsonRpcRequest,
-    JsonRpcResponse, LatestLedgerResponse, LedgerEntryItem, LedgerInfo, MineParams, MineResponse,
-    NetworkResponse, SendTransactionParams, SendTransactionResponse, SetLedgerEntryParams,
-    SetLedgerEntryResponse, SimulateHostFunctionResult, SimulateTransactionParams,
-    SimulateTransactionResponse, SimulationCost, VersionInfoResponse,
+    CloseLedgersParams, CloseLedgersResponse, GetLedgerEntriesParams, GetLedgerEntriesResponse,
+    GetLedgersParams, GetLedgersResponse, GetTransactionParams, GetTransactionResponse,
+    HealthResponse, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LatestLedgerResponse,
+    LedgerEntryItem, LedgerInfo, NetworkResponse, SendTransactionParams, SendTransactionResponse,
+    SetLedgerEntryParams, SetLedgerEntryResponse, SimulateHostFunctionResult,
+    SimulateTransactionParams, SimulateTransactionResponse, SimulationCost, VersionInfoResponse,
 };
 
 /// Shared HTTP-layer state. Cheap to clone (the actor handle clones an
@@ -83,8 +83,8 @@ async fn dispatch(
         "simulateTransaction" => handle_simulate_transaction(state, &req.params).await,
         "sendTransaction" => handle_send_transaction(state, &req.params).await,
         "getTransaction" => handle_get_transaction(state, &req.params).await,
-        "anvil_setLedgerEntry" => handle_anvil_set_ledger_entry(state, &req.params).await,
-        "anvil_mine" => handle_anvil_mine(state, &req.params).await,
+        "fork_setLedgerEntry" => handle_fork_set_ledger_entry(state, &req.params).await,
+        "fork_closeLedgers" => handle_fork_close_ledgers(state, &req.params).await,
         unknown => {
             warn!("soroban-fork: unsupported RPC method: {unknown}");
             Err(JsonRpcError::method_not_found(unknown))
@@ -598,12 +598,12 @@ async fn handle_get_transaction(
     serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
 }
 
-async fn handle_anvil_set_ledger_entry(
+async fn handle_fork_set_ledger_entry(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
     let parsed: SetLedgerEntryParams = serde_json::from_value(params.clone())
-        .map_err(|e| JsonRpcError::invalid_params(format!("anvil_setLedgerEntry params: {e}")))?;
+        .map_err(|e| JsonRpcError::invalid_params(format!("fork_setLedgerEntry params: {e}")))?;
 
     let key_bytes = BASE64
         .decode(&parsed.key)
@@ -641,38 +641,38 @@ async fn handle_anvil_set_ledger_entry(
     serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
 }
 
-async fn handle_anvil_mine(
+async fn handle_fork_close_ledgers(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    // Defaults: 1 block, +5s — Stellar's average ledger close rate.
-    // Both fields optional; null/absent params is valid (mine one
+    // Defaults: 1 ledger, +5s — Stellar's average ledger close rate.
+    // Both fields optional; null/absent params is valid (close one
     // ledger of default duration).
-    let parsed: MineParams = if params.is_null() {
-        MineParams {
-            blocks: None,
+    let parsed: CloseLedgersParams = if params.is_null() {
+        CloseLedgersParams {
+            ledgers: None,
             timestamp_advance_seconds: None,
         }
     } else {
         serde_json::from_value(params.clone())
-            .map_err(|e| JsonRpcError::invalid_params(format!("anvil_mine params: {e}")))?
+            .map_err(|e| JsonRpcError::invalid_params(format!("fork_closeLedgers params: {e}")))?
     };
-    let blocks = parsed.blocks.unwrap_or(1);
+    let ledgers = parsed.ledgers.unwrap_or(1);
     let timestamp_advance_seconds = parsed
         .timestamp_advance_seconds
-        .unwrap_or(blocks as u64 * 5);
+        .unwrap_or(ledgers as u64 * 5);
 
     let reply = state
         .actor
-        .send(|tx| Command::Mine {
-            blocks,
+        .send(|tx| Command::CloseLedgers {
+            ledgers,
             timestamp_advance_seconds,
             reply: tx,
         })
         .await
         .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
 
-    let body = MineResponse {
+    let body = CloseLedgersResponse {
         new_sequence: reply.new_sequence,
         new_close_time: reply.new_close_time.to_string(),
     };

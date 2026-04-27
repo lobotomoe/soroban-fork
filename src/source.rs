@@ -127,18 +127,19 @@ impl RpcSnapshotSource {
 
     /// Force-write a single `LedgerEntry` into the cache, replacing
     /// whatever was there (or creating a fresh entry if the key was
-    /// absent). Powers the JSON-RPC `anvil_setLedgerEntry` cheatcode
+    /// absent). Powers the JSON-RPC `fork_setLedgerEntry` extension
     /// — clients hand us an XDR-encoded entry, we trust them and
     /// install it. Subsequent reads (including via the host's
     /// recording-mode storage in `simulateTransaction` /
     /// `sendTransaction`) see the new entry.
     ///
-    /// This is the load-bearing primitive for Anvil-style stress
-    /// testing: any state mutation Anvil's `setStorageAt` /
-    /// `setBalance` / `setCode` cheatcodes do is just an entry
-    /// write, and Stellar's storage model maps cleanly to one
-    /// LedgerEntry-per-key. Higher-level wrappers (`setBalance`,
-    /// `setCode`, etc.) compose on top.
+    /// Stellar's storage model maps every piece of network state to
+    /// one `LedgerEntry` per key, so this single primitive covers
+    /// every flavor of fork-mode state mutation: oracle-price
+    /// rewrites (a `ContractData` entry), token balance overrides
+    /// (a `Trustline` or `ContractData` entry), contract code
+    /// replacement (a `ContractCode` entry). Higher-level wrappers
+    /// (`setBalance`, `setCode`, etc.) compose on top.
     ///
     /// `live_until` carries forward an optional TTL hint — pass
     /// `None` for entries that don't have one (Account, Trustline)

@@ -1,5 +1,6 @@
 //! Pre-funded deterministic accounts the fork mints at build time —
-//! the Anvil-equivalent of "ten test accounts with 10K ETH each".
+//! ten Stellar accounts pre-loaded with XLM and a USDC trustline,
+//! ready to sign envelopes against.
 //!
 //! When [`ForkConfig::build`] runs in server mode (or whenever
 //! [`ForkConfig::test_accounts`] is set, which it is by default), we

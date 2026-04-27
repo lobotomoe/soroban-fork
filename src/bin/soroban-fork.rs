@@ -14,14 +14,14 @@ use log::error;
 use soroban_fork::{server::Server, test_accounts, ForkConfig};
 
 /// Number of pre-funded deterministic test accounts the CLI mints
-/// at fork-build time. Mirrors Anvil's "10 accounts × 10K ETH"
-/// default. Override with `--accounts N` (set to 0 for none).
+/// at fork-build time. Override with `--accounts N` (set to 0 for
+/// none).
 const DEFAULT_TEST_ACCOUNTS: usize = 10;
 
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Lazy-loading mainnet/testnet fork for Soroban — Anvil-equivalent for Stellar."
+    about = "Lazy-loading mainnet/testnet fork for Soroban tests. Inspired by Foundry's Anvil."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -117,7 +117,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Anvil-style banner: prints the deterministic pre-funded accounts'
+/// Startup banner: prints the deterministic pre-funded accounts'
 /// "G..." (public) and "S..." (secret) strkeys to stdout, plus the
 /// listen URL, so users can paste them straight into JS-SDK code:
 ///

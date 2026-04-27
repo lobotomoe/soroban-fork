@@ -19,7 +19,7 @@
 //!
 //! - **Throughput is bounded by single-threaded execution** of contract
 //!   calls. Soroban contract execution is μs–ms range, and we're a test
-//!   harness, so this is fine. Foundry's Anvil makes the same trade-off.
+//!   harness, so this is fine.
 //! - **A panicking handler kills the worker thread**, dropping the
 //!   `Receiver` and breaking the whole server. v0.5 documents this; a
 //!   future version may add panic recovery via `catch_unwind` in the
@@ -103,9 +103,9 @@ pub(crate) enum Command {
     /// We run the same `invoke_host_function_in_recording_mode` path as
     /// `simulateTransaction`, but instead of throwing the result away,
     /// we capture `ledger_changes` and feed them back via
-    /// `RpcSnapshotSource::apply_changes`. Auth is in trust mode
-    /// (`Recording(false)`) — same UX as Anvil — so unsigned envelopes
-    /// from test code work without ceremony.
+    /// `RpcSnapshotSource::apply_changes`. Auth runs in trust mode
+    /// (`Recording(false)`) so unsigned envelopes from test code work
+    /// without ceremony.
     ///
     /// Receipts are stored on the worker keyed by the SHA-256 of the
     /// envelope; `GetTransaction` looks them up.
@@ -115,11 +115,11 @@ pub(crate) enum Command {
         source_account: AccountId,
         reply: oneshot::Sender<SendReply>,
     },
-    /// Anvil-style cheatcode: force-write a `LedgerEntry` directly
-    /// into the snapshot source, bypassing any host-level checks.
-    /// The load-bearing primitive for stress-testing scenarios —
-    /// oracle price manipulation, force-set token balances, replace
-    /// contract code, all reduce to one entry write.
+    /// Force-write a `LedgerEntry` directly into the snapshot
+    /// source, bypassing any host-level checks. The load-bearing
+    /// primitive for stress-testing scenarios — oracle price
+    /// manipulation, force-set token balances, replace contract
+    /// code, all reduce to one entry write.
     ///
     /// `live_until` carries an optional TTL hint for entries that
     /// have one (`ContractData`, `ContractCode`); pass `None` for
@@ -130,15 +130,19 @@ pub(crate) enum Command {
         live_until: Option<u32>,
         reply: oneshot::Sender<()>,
     },
-    /// Anvil-style `mine`: advance the fork's reported ledger
-    /// sequence by `blocks` and the close-time by
-    /// `timestamp_advance_seconds`. Used to push past
-    /// vesting-cliff / oracle-staleness thresholds without
-    /// orchestrating a real block flow.
-    Mine {
-        blocks: u32,
+    /// Close `ledgers` ledgers and bump the close-time by
+    /// `timestamp_advance_seconds`. Pushes time-sensitive contract
+    /// logic (vesting cliffs, oracle staleness) past thresholds
+    /// without orchestrating a real consensus round.
+    ///
+    /// Stellar talks about *closing* ledgers (finalising one and
+    /// moving on); this is that, simulated locally — the fork's
+    /// reported sequence + timestamp advance the same way real
+    /// ledger close moves them.
+    CloseLedgers {
+        ledgers: u32,
         timestamp_advance_seconds: u64,
-        reply: oneshot::Sender<MineReply>,
+        reply: oneshot::Sender<CloseLedgersReply>,
     },
     /// Look up a previously-applied transaction's receipt by hash.
     /// Hash is the 32-byte SHA-256 of the original envelope bytes.
@@ -242,8 +246,8 @@ pub(crate) struct TxReceipt {
     /// matches the envelope they sent.
     pub(crate) envelope_bytes: Vec<u8>,
     /// Ledger sequence at apply time. Each `sendTransaction` advances
-    /// the fork's reported sequence by one (block production by side
-    /// effect — same model Anvil's `evm_mine` uses).
+    /// the fork's reported sequence by one (ledger close by side
+    /// effect).
     pub(crate) ledger: u32,
     /// Unix-seconds timestamp the receipt was created at. Used by the
     /// wire `createdAt` field.
@@ -262,11 +266,11 @@ pub(crate) struct SendReply {
     pub(crate) receipt: TxReceipt,
 }
 
-/// Reply for `Command::Mine` — new ledger sequence + close-time so
-/// the wire response can confirm the bump without a follow-up
-/// `getLatestLedger` round-trip.
+/// Reply for `Command::CloseLedgers` — new ledger sequence +
+/// close-time so the wire response can confirm the bump without
+/// a follow-up `getLatestLedger` round-trip.
 #[derive(Debug)]
-pub(crate) struct MineReply {
+pub(crate) struct CloseLedgersReply {
     pub(crate) new_sequence: u32,
     pub(crate) new_close_time: u64,
 }
@@ -444,8 +448,8 @@ fn worker_loop(env: crate::ForkedEnv, mut rx: mpsc::Receiver<Command>) {
                 env.snapshot_source().set_entry(key, entry, live_until);
                 let _ = reply.send(());
             }
-            Command::Mine {
-                blocks,
+            Command::CloseLedgers {
+                ledgers,
                 timestamp_advance_seconds,
                 reply,
             } => {
@@ -453,8 +457,8 @@ fn worker_loop(env: crate::ForkedEnv, mut rx: mpsc::Receiver<Command>) {
                 // `ledger_sequence()` / `ledger_close_time()`
                 // accessors read straight from there, so subsequent
                 // `getLatestLedger` calls reflect the new values.
-                env.warp(blocks, timestamp_advance_seconds);
-                let _ = reply.send(MineReply {
+                env.warp(ledgers, timestamp_advance_seconds);
+                let _ = reply.send(CloseLedgersReply {
                     new_sequence: env.ledger_sequence(),
                     new_close_time: env.ledger_close_time(),
                 });
@@ -556,8 +560,7 @@ fn simulate_transaction(
 /// instead of discarding `ledger_changes` we feed them back into the
 /// source via [`crate::RpcSnapshotSource::apply_changes`]. The host
 /// runs with relaxed (trust-mode) auth — `Recording(false)` — so
-/// unsigned envelopes work the way Anvil's default mode does for
-/// EVM tests.
+/// unsigned envelopes from test code apply without ceremony.
 ///
 /// **What this is not.** v0.6 does not advance the fork's reported
 /// ledger sequence on each send (no block-by-side-effect yet). State
