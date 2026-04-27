@@ -43,8 +43,9 @@
 //! - `fork_setStorage` — landed in v0.8.2
 //! - `fork_setCode` — landed in v0.8.3
 //! - `fork_setBalance` (Classic assets) — landed in v0.8.4
+//! - `fork_etch` — landed in v0.8.6
 //! - `getEvents`, snapshot/revert, Soroban-token mint/burn,
-//!   `fork_etch`, `fork_impersonate` — pending
+//!   `fork_impersonate` — pending
 //!
 //! # Architecture
 //!

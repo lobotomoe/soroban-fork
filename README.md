@@ -274,7 +274,7 @@ What makes the toolset matter, in one test:
 
 Two cheatcode calls and a contract is callable. That's the Foundry-`vm.etch`-equivalent — the headline reason this toolset exists. Live in [`server_cheatcode_only_deploy_coexists_with_mainnet`](tests/server_smoke.rs); end-to-end against mainnet, ~70 LoC.
 
-### Methods supported in v0.8.5
+### Methods supported in v0.8.6
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -352,11 +352,25 @@ client can distinguish "this works against any Stellar RPC" from
   auto-create the trustline gets `flags = AUTHORIZED`,
   `limit = i64::MAX` — equivalent to having run `ChangeTrust` and
   the issuer authorising it. **Soroban-native token mint/burn
-  (the SAC `mint(to, amount)` invocation path) is scoped to
-  v0.8.5** — for now Soroban tokens whose underlying balance lives
-  in a Classic asset (e.g. mainnet USDC SAC, which routes to the
-  AlphaNum4 USDC trustline) work via the credit-asset path: write
-  the trustline directly, the SAC reads from the same entry.
+  (the SAC `mint(to, amount)` invocation path) is a v0.8.x
+  follow-up** — for now Soroban tokens whose underlying balance
+  lives in a Classic asset (e.g. mainnet USDC SAC, which routes
+  to the AlphaNum4 USDC trustline) work via the credit-asset
+  path: write the trustline directly, the SAC reads from the
+  same entry.
+- **`fork_etch`** *(new in v0.8.6)* — Foundry's
+  `vm.etch`-equivalent. Hot-swap the WASM under any contract
+  address in one wire call. Takes `contract` (strkey), `wasm`
+  (base64 bytes), optional `liveUntilLedgerSeq`. Internally:
+  install ContractCode, then read-modify-write the contract's
+  instance entry to point at the new code hash. **Storage is
+  preserved verbatim** — if the existing instance carries
+  contract state, swapping code keeps that state intact (the
+  hotfix scenario). **Auto-creates** the instance entry if the
+  target address has none yet — works on any address regardless
+  of prior state, just like Anvil. One wire call replaces the
+  `fork_setCode` + `fork_setStorage` dance the v0.8.5 showcase
+  uses.
 - **`fork_closeLedgers`** *(new in v0.8, renamed from `anvil_mine` in v0.8.1)* —
   close `ledgers` ledgers (default 1) and bump close-time by
   `timestampAdvanceSeconds` (default `ledgers * 5` — Stellar's
@@ -365,7 +379,7 @@ client can distinguish "this works against any Stellar RPC" from
   staleness) past thresholds without orchestrating real
   transactions.
 
-### What v0.8.5 server does NOT support
+### What v0.8.6 server does NOT support
 
 Listed up front so nothing surprises you:
 
@@ -378,12 +392,11 @@ Listed up front so nothing surprises you:
   through a Classic SAC), use `fork_setStorage` directly with the
   token's known balance-key shape, or wait for v0.8.5's `mint`
   invocation path.
-- **Ergonomic `fork_*` wrappers** — `setNonce`, `impersonate`,
-  `etch` (one-call code-swap under an existing contract). The
-  primitive `fork_setLedgerEntry` covers all of these once the
-  client constructs the right XDR; `fork_setStorage` (v0.8.2),
-  `fork_setCode` (v0.8.3), `fork_setBalance` (v0.8.4) are the
-  sugar wrappers landed so far.
+- **Ergonomic `fork_*` wrappers** — `setNonce`, `impersonate`.
+  The primitive `fork_setLedgerEntry` covers all of these once
+  the client constructs the right XDR; `fork_setStorage` (v0.8.2),
+  `fork_setCode` (v0.8.3), `fork_setBalance` (v0.8.4),
+  `fork_etch` (v0.8.6) are the sugar wrappers landed so far.
 - **`fork_snapshot` / `fork_revert`** — saved-state checkpoints.
   Scoped to v0.9 (the `Rc<HostImpl>` snapshot model needs its own
   design pass — either a journaling layer over `RpcSnapshotSource`

@@ -569,6 +569,36 @@ pub(crate) struct SetBalanceResponse {
     pub(crate) latest_ledger: u32,
 }
 
+/// `fork_etch` request: hot-swap the WASM under an existing
+/// contract address (Foundry's `vm.etch`-equivalent). Combines
+/// `fork_setCode` (write the new ContractCode entry) with a
+/// read-modify-write of the contract's instance entry to point
+/// at the new code hash.
+///
+/// - `contract`: strkey ("C...") of the contract to swap.
+/// - `wasm`: base64-encoded WASM bytes. Hash is server-derived
+///   (sha256), same way the host computes it — `fork_setCode`
+///   semantics.
+/// - `liveUntilLedgerSeq`: optional TTL applied to both the
+///   ContractCode and the instance ContractData entries.
+///
+/// **Auto-create**: if no instance entry exists at `contract`
+/// yet, synthesise one with empty storage. Matches Foundry's
+/// `vm.etch` (works on any address regardless of prior state).
+///
+/// **Storage preservation**: if an instance entry exists with
+/// non-empty `storage`, that storage is preserved verbatim;
+/// only the `executable` field swaps. Useful for hotfix
+/// scenarios where contract state must survive a code swap.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EtchParams {
+    pub(crate) contract: String,
+    pub(crate) wasm: String,
+    #[serde(default)]
+    pub(crate) live_until_ledger_seq: Option<u32>,
+}
+
 /// `getTransaction` response — receipt for a previously-applied tx.
 ///
 /// Field set is a deliberate subset of Stellar's wire shape: we

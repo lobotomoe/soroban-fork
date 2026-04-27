@@ -1832,6 +1832,90 @@ async fn simulate_invoke(
     .await
 }
 
+/// `fork_etch` is the one-call code-swap — the showcase test
+/// (v0.8.5) demonstrated that `fork_setCode` + `fork_setStorage`
+/// together can install a contract; `fork_etch` collapses both
+/// writes into one wire call.
+///
+/// This test verifies the auto-create branch (no pre-existing
+/// instance entry at the target address):
+/// 1. Pick synthetic address `[0xEE; 32]` (no prior state).
+/// 2. `fork_etch` installs add_i32.wasm there.
+/// 3. `simulateTransaction(C.add(7,8))` returns `I32(15)`.
+///
+/// The "swap code over existing instance, preserve storage"
+/// branch needs a second WASM fixture to demonstrate behavior
+/// change; that's a follow-up. The auto-create branch is the
+/// load-bearing one for the demo / mainnet-fork-with-fresh-
+/// contract use case — and the place where `fork_etch` actually
+/// saves work over `fork_setCode` + `fork_setStorage`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
+async fn server_fork_etch_installs_callable_contract_in_one_call() {
+    use sha2::{Digest, Sha256};
+
+    /// Same precompiled fixture as the showcase test.
+    const ADD_I32_WASM: &[u8] = include_bytes!("fixtures/add_i32.wasm");
+    /// 0xEE = "Etched" — distinct from 0xCC the showcase uses,
+    /// so the two tests can run against the same fork without
+    /// stepping on each other's state.
+    const ETCH_CONTRACT_ID: [u8; 32] = [0xEE; 32];
+
+    let (url, running) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let contract_strkey = format!("{}", stellar_strkey::Contract(ETCH_CONTRACT_ID));
+    let wasm_b64 = BASE64.encode(ADD_I32_WASM);
+    let expected_hash: [u8; 32] = Sha256::digest(ADD_I32_WASM).into();
+    let expected_hash_hex: String = expected_hash.iter().map(|b| format!("{b:02x}")).collect();
+
+    // Single etch call: code + instance in one shot.
+    let resp = jsonrpc_call(
+        &client,
+        &url,
+        "fork_etch",
+        serde_json::json!({
+            "contract": contract_strkey,
+            "wasm": wasm_b64,
+            "liveUntilLedgerSeq": 999_999_999u32,
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], true, "fork_etch must succeed");
+    assert_eq!(
+        resp["result"]["hash"].as_str().unwrap(),
+        expected_hash_hex,
+        "etch must echo the server-derived sha256(wasm)"
+    );
+
+    // Verify the contract is callable in the same fork.
+    let invoke_resp = simulate_invoke(
+        &client,
+        &url,
+        ETCH_CONTRACT_ID,
+        "add",
+        vec![ScVal::I32(7), ScVal::I32(8)],
+    )
+    .await;
+    assert!(
+        invoke_resp["result"]["error"].is_null(),
+        "etched contract.add(7,8) must simulate without error: {invoke_resp:#}"
+    );
+    let return_xdr = invoke_resp["result"]["results"][0]["xdr"]
+        .as_str()
+        .expect("etched contract returned a result xdr");
+    let return_scval = ScVal::from_xdr(BASE64.decode(return_xdr).unwrap(), Limits::none())
+        .expect("decode return ScVal");
+    assert_eq!(
+        return_scval,
+        ScVal::I32(15),
+        "fork_etch'd add(7,8) must compute 15 — proves the WASM both \
+         installed AND wired through the instance entry in one call"
+    );
+
+    running.shutdown().await.expect("shutdown");
+}
+
 // `dummy_source_account` is referenced from a docstring example only;
 // silence the unused-but-needed-as-sample warning.
 #[allow(dead_code)]

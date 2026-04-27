@@ -16,7 +16,7 @@ use soroban_env_host::xdr::{Limits, ReadXdr, WriteXdr};
 
 use crate::server::actor::{ActorHandle, Command, SimulationReply};
 use crate::server::types::{
-    AssetWire, CloseLedgersParams, CloseLedgersResponse, GetLedgerEntriesParams,
+    AssetWire, CloseLedgersParams, CloseLedgersResponse, EtchParams, GetLedgerEntriesParams,
     GetLedgerEntriesResponse, GetLedgersParams, GetLedgersResponse, GetTransactionParams,
     GetTransactionResponse, HealthResponse, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     LatestLedgerResponse, LedgerEntryItem, LedgerInfo, NetworkResponse, SendTransactionParams,
@@ -89,6 +89,7 @@ async fn dispatch(
         "fork_setStorage" => handle_fork_set_storage(state, &req.params).await,
         "fork_setCode" => handle_fork_set_code(state, &req.params).await,
         "fork_setBalance" => handle_fork_set_balance(state, &req.params).await,
+        "fork_etch" => handle_fork_etch(state, &req.params).await,
         "fork_closeLedgers" => handle_fork_close_ledgers(state, &req.params).await,
         unknown => {
             warn!("soroban-fork: unsupported RPC method: {unknown}");
@@ -1028,6 +1029,173 @@ async fn handle_fork_set_balance(
     let body = SetBalanceResponse {
         ok: true,
         latest_ledger: existing.latest_ledger,
+    };
+    serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+}
+
+/// `fork_etch` — Foundry's `vm.etch`-equivalent. Hot-swap the WASM
+/// under an existing contract address in one wire call.
+///
+/// Composes from existing primitives:
+/// 1. Install the new ContractCode entry (same as `fork_setCode`).
+/// 2. Read the existing instance entry at
+///    `(contract, ScVal::LedgerKeyContractInstance, Persistent)`.
+/// 3. Modify its `executable` field to point at the new code hash;
+///    preserve `storage` verbatim. If absent, synthesise a fresh
+///    instance with empty storage.
+/// 4. Write the (modified or synthesised) instance back.
+///
+/// All four ledger-source ops route through existing actor
+/// commands — no new `Command` variant.
+///
+/// **Race**: between the read of the instance entry and the write,
+/// another request could `fork_etch` the same address. The fork is
+/// a test tool, not multi-tenant production infrastructure, so this
+/// is documented-not-guarded-against. If it ever bites a user, the
+/// fix is a `Command::EtchAtomic` that holds the cache lock for both
+/// halves.
+///
+/// **Storage preservation**: if the existing instance carries a
+/// non-empty `ScMap` of instance storage (most real contracts do
+/// — the SDK's `env.storage().instance().set(...)` writes here),
+/// that map is copied verbatim into the new entry. The user gets
+/// "swap code, keep state" — the canonical hotfix scenario.
+async fn handle_fork_etch(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    use sha2::{Digest, Sha256};
+    use soroban_env_host::xdr::{
+        ContractCodeEntry, ContractCodeEntryExt, ContractDataDurability, ContractDataEntry,
+        ContractExecutable, ContractId, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData,
+        LedgerEntryExt, LedgerKey, LedgerKeyContractCode, LedgerKeyContractData, ScAddress,
+        ScContractInstance, ScVal,
+    };
+
+    let parsed: EtchParams = serde_json::from_value(params.clone())
+        .map_err(|e| JsonRpcError::invalid_params(format!("fork_etch params: {e}")))?;
+
+    // ---- Decode inputs ----
+    let contract_strkey = stellar_strkey::Contract::from_string(&parsed.contract).map_err(|e| {
+        JsonRpcError::invalid_params(format!("contract: not a valid C... strkey: {e}"))
+    })?;
+    let contract_address = ScAddress::Contract(ContractId(Hash(contract_strkey.0)));
+
+    let wasm = BASE64
+        .decode(&parsed.wasm)
+        .map_err(|e| JsonRpcError::invalid_params(format!("wasm: base64 decode: {e}")))?;
+    let new_hash_bytes: [u8; 32] = Sha256::digest(&wasm).into();
+    let new_hash = Hash(new_hash_bytes);
+
+    // ---- Step 1: install the new ContractCode entry ----
+    let code_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: new_hash.clone(),
+    });
+    let code_entry = LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::ContractCode(ContractCodeEntry {
+            ext: ContractCodeEntryExt::V0,
+            hash: new_hash.clone(),
+            code: wasm.try_into().map_err(|_| {
+                JsonRpcError::invalid_params("wasm: bytes exceed XDR BytesM<u32::MAX> capacity")
+            })?,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+    state
+        .actor
+        .send(|tx| Command::SetLedgerEntry {
+            key: code_key,
+            entry: code_entry,
+            live_until: parsed.live_until_ledger_seq,
+            reply: tx,
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    // ---- Step 2: read the existing instance entry (if any) ----
+    let instance_key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: contract_address.clone(),
+        key: ScVal::LedgerKeyContractInstance,
+        durability: ContractDataDurability::Persistent,
+    });
+    let existing = state
+        .actor
+        .send(|tx| Command::GetLedgerEntries {
+            keys: vec![instance_key.clone()],
+            reply: tx,
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+    let existing_entry = existing.entries.into_iter().next().flatten();
+
+    // ---- Step 3: build the (modified or synthesised) instance entry ----
+    let preserved_storage = match existing_entry {
+        Some((_, entry, _)) => match &entry.data {
+            LedgerEntryData::ContractData(cd) => match &cd.val {
+                ScVal::ContractInstance(instance) => instance.storage.clone(),
+                // The instance entry exists but its `val` isn't a
+                // ContractInstance — that's a host invariant violation
+                // (the host always writes ContractInstance under
+                // LedgerKeyContractInstance keys). Surface as internal
+                // error rather than silently overwriting non-instance
+                // data.
+                other => {
+                    return Err(JsonRpcError::internal_error(format!(
+                        "instance entry's val is not ContractInstance: {other:?} \
+                         (host invariant violation; refusing to overwrite)"
+                    )));
+                }
+            },
+            other => {
+                return Err(JsonRpcError::internal_error(format!(
+                    "instance LedgerKey resolved to non-ContractData entry: {other:?}"
+                )));
+            }
+        },
+        // No existing instance — auto-create with empty storage.
+        None => None,
+    };
+
+    let new_instance_val = ScVal::ContractInstance(ScContractInstance {
+        executable: ContractExecutable::Wasm(new_hash),
+        storage: preserved_storage,
+    });
+    let new_instance_entry = LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_address,
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: new_instance_val,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    state
+        .actor
+        .send(|tx| Command::SetLedgerEntry {
+            key: instance_key,
+            entry: new_instance_entry,
+            live_until: parsed.live_until_ledger_seq,
+            reply: tx,
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    let latest = state
+        .actor
+        .send(|tx| Command::GetLatestLedger { reply: tx })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    // Reuse SetCodeResponse — same wire shape, no need to invent a
+    // separate type for what's literally `{ ok, hash, latestLedger }`.
+    let body = SetCodeResponse {
+        ok: true,
+        hash: hex_lower(&new_hash_bytes),
+        latest_ledger: latest.sequence,
     };
     serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
 }
