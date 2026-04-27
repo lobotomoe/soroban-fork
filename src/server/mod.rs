@@ -41,8 +41,9 @@
 //! - `sendTransaction`, `getTransaction` — landed in v0.6
 //! - `fork_setLedgerEntry`, `fork_closeLedgers` — landed in v0.8
 //! - `fork_setStorage` — landed in v0.8.2
+//! - `fork_setCode` — landed in v0.8.3
 //! - `getEvents`, snapshot/revert, ergonomic wrappers (`fork_setBalance`,
-//!   `fork_setCode`, `fork_impersonate`) — pending
+//!   `fork_etch`, `fork_impersonate`) — pending
 //!
 //! # Architecture
 //!

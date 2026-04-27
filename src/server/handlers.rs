@@ -20,9 +20,9 @@ use crate::server::types::{
     GetLedgersParams, GetLedgersResponse, GetTransactionParams, GetTransactionResponse,
     HealthResponse, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LatestLedgerResponse,
     LedgerEntryItem, LedgerInfo, NetworkResponse, SendTransactionParams, SendTransactionResponse,
-    SetLedgerEntryParams, SetLedgerEntryResponse, SetStorageParams, SimulateHostFunctionResult,
-    SimulateTransactionParams, SimulateTransactionResponse, SimulationCost, StorageDurability,
-    VersionInfoResponse,
+    SetCodeParams, SetCodeResponse, SetLedgerEntryParams, SetLedgerEntryResponse, SetStorageParams,
+    SimulateHostFunctionResult, SimulateTransactionParams, SimulateTransactionResponse,
+    SimulationCost, StorageDurability, VersionInfoResponse,
 };
 
 /// Shared HTTP-layer state. Cheap to clone (the actor handle clones an
@@ -86,6 +86,7 @@ async fn dispatch(
         "getTransaction" => handle_get_transaction(state, &req.params).await,
         "fork_setLedgerEntry" => handle_fork_set_ledger_entry(state, &req.params).await,
         "fork_setStorage" => handle_fork_set_storage(state, &req.params).await,
+        "fork_setCode" => handle_fork_set_code(state, &req.params).await,
         "fork_closeLedgers" => handle_fork_close_ledgers(state, &req.params).await,
         unknown => {
             warn!("soroban-fork: unsupported RPC method: {unknown}");
@@ -729,6 +730,77 @@ async fn handle_fork_set_storage(
 
     let body = SetLedgerEntryResponse {
         ok: true,
+        latest_ledger: latest.sequence,
+    };
+    serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+}
+
+/// `fork_setCode` — sugar over `fork_setLedgerEntry` for uploading
+/// WASM bytes as a `ContractCode` entry.
+///
+/// The entry's lookup hash is sha256 of the bytes — server-derived
+/// so a malicious or buggy client can't install bytes under a
+/// different hash than the host would compute. The hash is echoed
+/// back in the response so callers can wire a `CreateContract` to
+/// point at this code, or compose with `fork_setStorage` over the
+/// contract's instance ScVal for a full etch-equivalent.
+///
+/// `last_modified_ledger_seq` is set to `0` for the same reason
+/// `fork_setStorage` does: the wrapper is honest about being
+/// synthesised — there's no real ledger close behind this write.
+async fn handle_fork_set_code(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    use sha2::{Digest, Sha256};
+    use soroban_env_host::xdr::{
+        ContractCodeEntry, ContractCodeEntryExt, Hash, LedgerEntry, LedgerEntryData,
+        LedgerEntryExt, LedgerKey, LedgerKeyContractCode,
+    };
+
+    let parsed: SetCodeParams = serde_json::from_value(params.clone())
+        .map_err(|e| JsonRpcError::invalid_params(format!("fork_setCode params: {e}")))?;
+
+    let wasm = BASE64
+        .decode(&parsed.wasm)
+        .map_err(|e| JsonRpcError::invalid_params(format!("wasm: base64 decode: {e}")))?;
+
+    let hash_bytes: [u8; 32] = Sha256::digest(&wasm).into();
+    let hash = Hash(hash_bytes);
+
+    let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
+    let ledger_entry = LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::ContractCode(ContractCodeEntry {
+            ext: ContractCodeEntryExt::V0,
+            hash,
+            code: wasm.try_into().map_err(|_| {
+                JsonRpcError::invalid_params("wasm: bytes exceed XDR BytesM<u32::MAX> capacity")
+            })?,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    state
+        .actor
+        .send(|tx| Command::SetLedgerEntry {
+            key: ledger_key,
+            entry: ledger_entry,
+            live_until: parsed.live_until_ledger_seq,
+            reply: tx,
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    let latest = state
+        .actor
+        .send(|tx| Command::GetLatestLedger { reply: tx })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    let body = SetCodeResponse {
+        ok: true,
+        hash: hex_lower(&hash_bytes),
         latest_ledger: latest.sequence,
     };
     serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))

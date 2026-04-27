@@ -478,6 +478,32 @@ pub(crate) enum StorageDurability {
     Temporary,
 }
 
+/// `fork_setCode` request: upload WASM bytes as a `ContractCode`
+/// ledger entry. The hash is server-derived (sha256 of the bytes)
+/// so caller-supplied hashes can't lie about what was installed.
+///
+/// `liveUntilLedgerSeq` is optional — TTL hint stored alongside
+/// the entry. Pass `None` if your test doesn't care about expiry.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetCodeParams {
+    pub(crate) wasm: String,
+    #[serde(default)]
+    pub(crate) live_until_ledger_seq: Option<u32>,
+}
+
+/// `fork_setCode` response — echoes the hex-encoded sha256 hash
+/// the entry was keyed by, so the caller can wire up a
+/// `CreateContract` (or `fork_setStorage` over the contract's
+/// instance ScVal) to point at it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetCodeResponse {
+    pub(crate) ok: bool,
+    pub(crate) hash: String,
+    pub(crate) latest_ledger: u32,
+}
+
 /// `getTransaction` response — receipt for a previously-applied tx.
 ///
 /// Field set is a deliberate subset of Stellar's wire shape: we

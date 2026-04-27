@@ -1330,6 +1330,93 @@ async fn server_fork_set_storage_writes_contract_data() {
     running.shutdown().await.expect("shutdown");
 }
 
+/// `fork_setCode` uploads WASM bytes as a `ContractCode` entry,
+/// keyed by sha256 of those bytes. Verifies:
+/// 1. The response's `hash` field matches what the client itself
+///    would compute via sha256 — proving the server didn't pick
+///    a different hash than promised.
+/// 2. A subsequent `getLedgerEntries` for `LedgerKey::ContractCode(hash)`
+///    returns the entry, and the contained `code` bytes are
+///    byte-for-byte what we uploaded.
+///
+/// Why this matters: this is what unblocks pure-cheatcode contract
+/// installation (no `UploadContractWasm` envelope needed). Combined
+/// with `fork_setStorage` over a `ContractInstance` ScVal, callers
+/// can build a contract instance pointing at the uploaded code
+/// without any host invocation — the etch-equivalent path.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
+async fn server_fork_set_code_uploads_wasm() {
+    use sha2::{Digest, Sha256};
+    use soroban_env_host::xdr::{LedgerEntryData, LedgerKeyContractCode};
+
+    /// Same precompiled fixture the deploy-and-invoke test uses —
+    /// one source of truth for "a tiny but valid Soroban WASM."
+    const ADD_I32_WASM: &[u8] = include_bytes!("fixtures/add_i32.wasm");
+
+    let (url, running) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let wasm_b64 = BASE64.encode(ADD_I32_WASM);
+    let expected_hash: [u8; 32] = Sha256::digest(ADD_I32_WASM).into();
+    let expected_hash_hex: String = expected_hash.iter().map(|b| format!("{b:02x}")).collect();
+
+    let resp = jsonrpc_call(
+        &client,
+        &url,
+        "fork_setCode",
+        serde_json::json!({
+            "wasm": wasm_b64,
+            "liveUntilLedgerSeq": 999_999_999u32,
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], true);
+    assert_eq!(
+        resp["result"]["hash"].as_str().unwrap(),
+        expected_hash_hex,
+        "server-reported hash must match sha256(wasm) the client would compute"
+    );
+    assert!(resp["result"]["latestLedger"].as_u64().unwrap() > 0);
+
+    // Verify the entry actually got installed, by reading it back
+    // through getLedgerEntries with the matching ContractCode key.
+    let lookup_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: Hash(expected_hash),
+    });
+    let lookup_b64 = BASE64.encode(lookup_key.to_xdr(Limits::none()).unwrap());
+    let read = jsonrpc_call(
+        &client,
+        &url,
+        "getLedgerEntries",
+        serde_json::json!({ "keys": [lookup_b64] }),
+    )
+    .await;
+    let entries = read["result"]["entries"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "fork_setCode-uploaded entry must be visible via getLedgerEntries"
+    );
+
+    // Decode the returned entry and confirm the code bytes match.
+    let returned_xdr_b64 = entries[0]["xdr"].as_str().unwrap();
+    let returned_bytes = BASE64.decode(returned_xdr_b64).unwrap();
+    let returned_data = LedgerEntryData::from_xdr(returned_bytes, Limits::none()).expect("decode");
+    let (returned_hash, returned_code) = match returned_data {
+        LedgerEntryData::ContractCode(cc) => (cc.hash, cc.code),
+        other => panic!("expected ContractCode, got {other:?}"),
+    };
+    assert_eq!(returned_hash.0, expected_hash, "returned hash must match");
+    assert_eq!(
+        returned_code.as_slice(),
+        ADD_I32_WASM,
+        "returned code bytes must be byte-for-byte what we uploaded"
+    );
+
+    running.shutdown().await.expect("shutdown");
+}
+
 // `dummy_source_account` is referenced from a docstring example only;
 // silence the unused-but-needed-as-sample warning.
 #[allow(dead_code)]

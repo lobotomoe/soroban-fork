@@ -263,7 +263,7 @@ Soroswap, etc.) follow the same pattern: dependencies the deployed
 contract reaches into get lazy-fetched from mainnet and cached
 locally.
 
-### Methods supported in v0.8.2
+### Methods supported in v0.8.3
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -322,6 +322,14 @@ client can distinguish "this works against any Stellar RPC" from
   XDR server-side so clients don't have to assemble the
   multi-level enum nesting themselves. Use this for oracle
   price overrides and contract-storage scenarios.
+- **`fork_setCode`** *(new in v0.8.3)* — upload WASM bytes as a
+  `ContractCode` ledger entry, keyed by sha256 of those bytes.
+  Takes `wasm` (base64) and optional `liveUntilLedgerSeq`.
+  Returns `{ ok, hash, latestLedger }` — the hash is server-derived
+  (the host computes it the same way), so callers can wire a
+  follow-up `CreateContract` (or `fork_setStorage` over a
+  `ContractInstance` ScVal) to point at the uploaded code without
+  any host invocation.
 - **`fork_closeLedgers`** *(new in v0.8, renamed from `anvil_mine` in v0.8.1)* —
   close `ledgers` ledgers (default 1) and bump close-time by
   `timestampAdvanceSeconds` (default `ledgers * 5` — Stellar's
@@ -330,18 +338,19 @@ client can distinguish "this works against any Stellar RPC" from
   staleness) past thresholds without orchestrating real
   transactions.
 
-### What v0.8.2 server does NOT support
+### What v0.8.3 server does NOT support
 
 Listed up front so nothing surprises you:
 
 - **`getEvents`** — historical event filtering. Diagnostic events
   emitted during simulation are reachable via `simulateTransaction`'s
   response.
-- **Ergonomic `fork_*` wrappers** — `setBalance`, `setCode`,
-  `setNonce`, `impersonate`. The primitive `fork_setLedgerEntry`
-  covers all of these once the client constructs the right XDR;
-  `fork_setStorage` (v0.8.2) is the first sugar wrapper to land,
-  the rest follow in v0.8.x.
+- **Ergonomic `fork_*` wrappers** — `setBalance`, `setNonce`,
+  `impersonate`, `etch` (one-call code-swap under an existing
+  contract). The primitive `fork_setLedgerEntry` covers all of
+  these once the client constructs the right XDR;
+  `fork_setStorage` (v0.8.2) and `fork_setCode` (v0.8.3) are the
+  sugar wrappers landed so far, the rest follow in v0.8.x.
 - **`fork_snapshot` / `fork_revert`** — saved-state checkpoints.
   Scoped to v0.9 (the `Rc<HostImpl>` snapshot model needs its own
   design pass — either a journaling layer over `RpcSnapshotSource`
