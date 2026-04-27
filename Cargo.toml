@@ -1,6 +1,6 @@
 [package]
 name = "soroban-fork"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Lazy-loading mainnet/testnet fork for Soroban tests — an Anvil-equivalent for Stellar."
@@ -34,6 +34,9 @@ soroban-env-host = { version = "25.0.1", features = ["testutils", "recording_mod
 soroban-sdk = { version = "25.3.0", features = ["testutils"] }
 soroban-ledger-snapshot = "25.3.0"
 stellar-strkey = "0.0.16"
+# Deterministic ed25519 keypair derivation for the pre-funded test
+# accounts the fork mints at build time. Used in `src/test_accounts.rs`.
+ed25519-dalek = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

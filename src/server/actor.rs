@@ -564,6 +564,30 @@ fn send_transaction(
         Err(e) => (Err(format!("recording-mode error: {e}")), 0),
     };
 
+    // Bump the source account's seq_num so subsequent envelopes
+    // built from `getAccount` → `seq + 1` validate as the host
+    // expects. Only on success — a failed invocation should not
+    // burn a sequence number, mirroring real Stellar core where
+    // a tx that fails validation doesn't advance the account's
+    // seq either.
+    //
+    // `bump_account_seq` returns `None` when the source account
+    // isn't cached locally; that's the "first send from a never-
+    // pre-funded mainnet account" case. We log and move on rather
+    // than failing the send — the receipt still says SUCCESS for
+    // the host invocation itself, which is the truth.
+    if result.is_ok()
+        && env
+            .snapshot_source()
+            .bump_account_seq(&source_account)
+            .is_none()
+    {
+        log::debug!(
+            "soroban-fork: source account {source_account:?} not cached; \
+             seq not bumped (sendTransaction still applied)"
+        );
+    }
+
     let receipt = TxReceipt {
         result,
         envelope_bytes,

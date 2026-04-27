@@ -11,7 +11,12 @@ use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
 use log::error;
-use soroban_fork::{server::Server, ForkConfig};
+use soroban_fork::{server::Server, test_accounts, ForkConfig};
+
+/// Number of pre-funded deterministic test accounts the CLI mints
+/// at fork-build time. Mirrors Anvil's "10 accounts × 10K ETH"
+/// default. Override with `--accounts N` (set to 0 for none).
+const DEFAULT_TEST_ACCOUNTS: usize = 10;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -55,6 +60,13 @@ enum Command {
         /// simulation; useful when consumers ask for trace output.
         #[arg(long)]
         tracing: bool,
+
+        /// Number of pre-funded deterministic test accounts to
+        /// mint into the fork. Each gets 100K XLM. The same seed
+        /// produces the same accounts every run, so test code can
+        /// reference them by index (e.g. `account_0`). Default: 10.
+        #[arg(long, default_value_t = DEFAULT_TEST_ACCOUNTS)]
+        accounts: usize,
     },
 }
 
@@ -82,8 +94,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             listen,
             cache,
             tracing,
+            accounts,
         } => {
-            let mut config = ForkConfig::new(rpc).tracing(tracing);
+            // Print the pre-funded test accounts BEFORE handing off
+            // to the server. The accounts are deterministic, so the
+            // ones we print here match the ones the server's actor
+            // mints during fork-build — no risk of divergence.
+            print_account_banner(accounts, listen);
+
+            let mut config = ForkConfig::new(rpc)
+                .tracing(tracing)
+                .test_account_count(accounts);
             if let Some(path) = cache {
                 config = config.cache_file(path);
             }
@@ -94,4 +115,38 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
+}
+
+/// Anvil-style banner: prints the deterministic pre-funded accounts'
+/// "G..." (public) and "S..." (secret) strkeys to stdout, plus the
+/// listen URL, so users can paste them straight into JS-SDK code:
+///
+/// ```text
+/// soroban-fork v0.7
+/// Listening on http://127.0.0.1:8000
+///
+/// Available test accounts:
+/// (0) GBXXX...AB12 (100000.0000000 XLM)  →  SAXXX...CD34
+/// (1) GCYYY...EF56 (100000.0000000 XLM)  →  SAXXX...GH78
+/// ...
+/// ```
+fn print_account_banner(count: usize, listen: SocketAddr) {
+    println!("soroban-fork v{}", env!("CARGO_PKG_VERSION"));
+    println!("Listening on http://{listen}");
+    if count == 0 {
+        println!("(no pre-funded test accounts; pass --accounts N to enable)");
+        return;
+    }
+    println!();
+    println!("Available test accounts:");
+    let accounts = test_accounts::generate(count);
+    for (i, account) in accounts.iter().enumerate() {
+        let xlm = account.balance_stroops as f64 / 10_000_000.0;
+        println!(
+            "({i}) {}  ({xlm:.7} XLM)  ->  {}",
+            account.account_strkey(),
+            account.secret_key_strkey()
+        );
+    }
+    println!();
 }

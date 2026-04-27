@@ -206,7 +206,64 @@ const result = await server.simulateTransaction(tx);  // hits the fork
 Or via the Rust `stellar-rpc-client`, raw curl, or anything that
 understands the spec.
 
-### Methods supported in v0.6
+### Pre-funded test accounts *(new in v0.7)*
+
+The fork mints **10 deterministic test accounts** at build time, each
+with 100K XLM and a USDC trustline ready to receive — Anvil's "10
+accounts × 10K ETH" UX for Stellar. Same seed produces the same
+accounts every run, so test code can hard-code addresses by index.
+The CLI prints them on startup:
+
+```
+soroban-fork v0.7
+Listening on http://127.0.0.1:8000
+
+Available test accounts:
+(0) GBXXX...AB12  (100000.0000000 XLM)  ->  SAXXX...CD34
+(1) GCYYY...EF56  (100000.0000000 XLM)  ->  SAXXX...GH78
+...
+```
+
+Pass them to JS-SDK's `Keypair.fromSecret(...)` to sign envelopes.
+After every successful `sendTransaction`, the source account's
+sequence number auto-increments — so chained `getAccount` →
+`TransactionBuilder` → `sendTransaction` loops just work.
+
+**Real DEX flow works end-to-end.** A test account can swap XLM →
+USDC against the live Phoenix DEX (or Soroswap, Aquarius, …) and
+the USDC actually lands in its trustline. Smoke-tested:
+1000 XLM → 167.4020548 USDC at the live mainnet pool reserves.
+
+**No hidden hardcode.** The trustline default targets the mainnet
+USDC issuer (Circle); for testnet, futurenet, or a custom fork,
+override via `ForkConfig::test_account_trustlines(vec![...])`. The
+trustlines are written with `flags = AUTHORIZED_FLAG`, `limit = i64::MAX` —
+shape-equivalent to running `ChangeTrust` then having the issuer
+authorize, just bootstrapped at build time. Auth runs in trust mode
+(`Recording(false)`), Anvil-equivalent for tests.
+
+Override count via `--accounts N` (set to `0` to disable). For
+library users, `ForkConfig::test_account_count(n).build()` exposes
+the same machinery; read accounts back with `env.test_accounts()`.
+
+### Deploy your own contracts onto the fork *(new in v0.7)*
+
+The same `sendTransaction` accepts `HostFunction::UploadContractWasm`
+and `HostFunction::CreateContract`, so you can deploy custom contracts
+straight onto the forked mainnet state and have them call live
+production contracts. The test suite's
+`server_deploy_and_invoke_custom_contract` covers the full loop:
+
+1. Upload a tiny `add(i32, i32) -> i32` WASM
+2. Create the contract instance from the uploaded hash
+3. Invoke `add(2, 3)` on the deployed contract — returns 5
+
+Cross-protocol scenarios (your contract calls Blend, Phoenix,
+Soroswap, etc.) follow the same pattern: dependencies the deployed
+contract reaches into get lazy-fetched from mainnet and cached
+locally.
+
+### Methods supported in v0.7
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -243,7 +300,7 @@ understands the spec.
   envelope, the host function's `ScVal` return value, and the
   applied-changes count when found.
 
-### What v0.6 server does NOT support
+### What v0.7 server does NOT support
 
 Listed up front so nothing surprises you:
 
@@ -251,16 +308,16 @@ Listed up front so nothing surprises you:
   emitted during simulation are reachable via `simulateTransaction`'s
   response.
 - **`anvil_*` cheatcodes** — `setBalance`, `setStorage`, `setCode`,
-  `impersonate`. Scoped to v0.7 alongside the cheatcode primitives.
+  `impersonate`. Scoped to v0.8 alongside the cheatcode primitives.
 - **`anvil_snapshot` / `anvil_revert`** — saved-state checkpoints.
-  Scoped to v0.8 (the `Rc<HostImpl>` snapshot model needs its own
+  Scoped to v0.9 (the `Rc<HostImpl>` snapshot model needs its own
   design pass).
 - **`sendTransaction` ledger advancement** — each successful send
-  applies its writes to the snapshot source but does not yet bump
-  `env.ledger().sequence_number()`. Time-sensitive contract logic
-  (vesting, oracle staleness checks) sees the same ledger across
-  multiple sends until you call `env.warp(...)` from lib mode.
-  Block-by-side-effect is a v0.6.x followup.
+  applies its writes and bumps the source's `seq_num`, but does not
+  yet bump `env.ledger().sequence_number()`. Time-sensitive contract
+  logic (vesting, oracle staleness checks) sees the same ledger
+  across multiple sends until you call `env.warp(...)` from lib mode.
+  Block-by-side-effect is a v0.7.x followup.
 - **`resultMetaXdr` on `getTransaction`** — Stellar's
   `TransactionMeta::V3` carries state-change deltas in a
   Stellar-core-XDR-heavy shape; v0.6 returns `returnValueXdr` and
@@ -446,7 +503,7 @@ that were lazy-fetched during the test. This means the second run of a test with
 
 What soroban-fork does NOT yet do — listed up front so nothing surprises you in production:
 
-- ~~**No `sendTransaction` / state mutation through RPC.**~~ *(closed in v0.6.)* Server-mode `sendTransaction` now applies writes back to the snapshot source so subsequent reads see them; `getTransaction` retrieves receipts by hash. `anvil_*` cheatcodes (impersonate / setBalance / setCode) are still scoped to v0.7; `anvil_snapshot` / `anvil_revert` to v0.8.
+- ~~**No `sendTransaction` / state mutation through RPC.**~~ *(closed in v0.6.)* Server-mode `sendTransaction` applies writes back to the snapshot source so subsequent reads see them; `getTransaction` retrieves receipts by hash. *(closed in v0.7:)* the fork now mints 10 pre-funded test accounts at build, auto-increments `seq_num` after every successful send, and accepts `UploadContractWasm` + `CreateContract` host functions — full deploy-then-call workflow against forked mainnet works. `anvil_*` cheatcodes (impersonate / setBalance / setCode / setStorage) are scoped to v0.8; `anvil_snapshot` / `anvil_revert` to v0.9.
 - **No TTL / archival simulation.** Soroban entries carry a `live_until_ledger_seq`; on real mainnet they become archived past that ledger and need a `RestoreFootprint` operation. We track `live_until` in the cache but do not yet model expiry — bumping `env.ledger()` past an entry's `live_until` will not flip it to archived. Tests that depend on TTL-expiry semantics will see false-positives.
 - **No historical state.** `at_ledger(N)` shifts only what `env.ledger().sequence_number()` reports; the actual ledger entries are always fetched at the RPC's *current* latest. Pin to a specific ledger only when paired with `cache_file` for reproducibility, not when expecting historical state.
 - **Tracing renders structure, not metering.** `env.trace()` captures the call tree with decoded args and return values. It does **not** yet render per-frame gas / cost units, contract events, or decoded `HostError` reasons. (Diagnostic events from the host carry call structure but not metering numbers; metering is planned. Server-mode `simulateTransaction` does return real `cost.cpuInsns` separately.)

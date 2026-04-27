@@ -47,6 +47,7 @@ mod error;
 pub mod fees;
 mod rpc;
 mod source;
+pub mod test_accounts;
 pub mod trace;
 
 /// JSON-RPC server mode. Available with the `server` cargo feature —
@@ -100,6 +101,11 @@ pub struct ForkedEnv {
     /// six on-chain `ConfigSetting` entries the first time it's asked
     /// for and reused thereafter.
     fee_configuration: OnceCell<fees::FeeConfiguration>,
+    /// Pre-funded deterministic accounts the fork minted at build
+    /// time, exposed for test/demo code that wants to use them as
+    /// transaction sources. Empty when the user disabled them via
+    /// [`ForkConfig::without_test_accounts`].
+    test_accounts: Vec<test_accounts::TestAccount>,
 }
 
 impl std::ops::Deref for ForkedEnv {
@@ -249,6 +255,18 @@ impl ForkedEnv {
         &self.source
     }
 
+    /// Pre-funded deterministic test accounts the fork minted at
+    /// build time. Empty when [`ForkConfig::test_account_count`] was
+    /// set to `0`.
+    ///
+    /// Each carries the secret seed (so test/demo code can sign
+    /// envelopes from the account) and the public key. Use
+    /// [`test_accounts::TestAccount::account_strkey`] for the
+    /// `G...` source-account string JS-SDK clients expect.
+    pub fn test_accounts(&self) -> &[test_accounts::TestAccount] {
+        &self.test_accounts
+    }
+
     /// The on-chain Soroban resource-fee schedule for this forked
     /// network, resolved lazily on first call.
     ///
@@ -386,6 +404,21 @@ pub struct ForkConfig {
     max_protocol_version: Option<u32>,
     rpc_config: RpcConfig,
     tracing: bool,
+    /// Number of pre-funded test accounts to mint at build time.
+    /// `0` disables them. Default: 10 (Anvil parity).
+    test_account_count: usize,
+    /// Trustlines to pre-create for each test account against
+    /// Stellar-Classic-issued assets. Required so that SAC `transfer`
+    /// to a test account succeeds — without a trustline the host
+    /// returns `Error(Contract, #13) "trustline missing"`.
+    ///
+    /// Default targets the **mainnet USDC** issuer (Circle), since
+    /// that's what most demos and dapp tests reach for. Forks
+    /// pointing at testnet or a custom network should override via
+    /// [`ForkConfig::test_account_trustlines`] — the default's
+    /// issuer would still preload, but testnet's USDC SAC routes
+    /// through a different issuer and would never write to it.
+    test_trustlines: Vec<soroban_env_host::xdr::TrustLineAsset>,
 }
 
 impl ForkConfig {
@@ -410,6 +443,8 @@ impl ForkConfig {
             max_protocol_version: None,
             rpc_config: RpcConfig::default(),
             tracing: false,
+            test_account_count: 10,
+            test_trustlines: vec![test_accounts::usdc_mainnet_trustline_asset()],
         }
     }
 
@@ -505,6 +540,45 @@ impl ForkConfig {
     /// flipping it on only for the failing case.
     pub fn tracing(mut self, enabled: bool) -> Self {
         self.tracing = enabled;
+        self
+    }
+
+    /// Number of pre-funded deterministic test accounts to mint at
+    /// fork-build time. Each gets ~100K XLM. Default: 10
+    /// (Anvil-equivalent UX). Set to `0` to skip account
+    /// pre-population — useful when the only thing you'll do with
+    /// the fork is read mainnet state, never construct envelopes.
+    ///
+    /// The accounts are deterministic: the same seed string
+    /// produces the same keypairs across runs and across machines,
+    /// so test code can reference them by index without juggling
+    /// fixtures. Read them back via [`ForkedEnv::test_accounts`].
+    pub fn test_account_count(mut self, count: usize) -> Self {
+        self.test_account_count = count;
+        self
+    }
+
+    /// Replace the list of Classic assets the fork pre-creates
+    /// trustlines for, on each test account. Default is
+    /// `[mainnet USDC]`.
+    ///
+    /// **When to override.** Forking a non-mainnet network (testnet,
+    /// futurenet, custom) — the default issuer doesn't exist there,
+    /// so USDC SAC operations would still fail. Pass the assets
+    /// your dapp actually transacts with, with the right issuers
+    /// for that network. Pass an empty `Vec` to skip trustline
+    /// pre-creation entirely (tests that only use Soroban-native
+    /// tokens and Contract-address recipients don't need them).
+    ///
+    /// Builds a trustline with `flags = AUTHORIZED_FLAG`, `limit =
+    /// i64::MAX`, `balance = 0`. Equivalent to the user having run
+    /// `ChangeTrust` and the issuer having authorized the trustline
+    /// — minus the round-trip through the issuer's KYC.
+    pub fn test_account_trustlines(
+        mut self,
+        assets: Vec<soroban_env_host::xdr::TrustLineAsset>,
+    ) -> Self {
+        self.test_trustlines = assets;
         self
     }
 
@@ -620,6 +694,46 @@ impl ForkConfig {
 
         info!("soroban-fork: forked at ledger {sequence} (protocol {protocol_version})");
 
+        // Pre-mint deterministic test accounts. Doing this AFTER the
+        // env is built means the freshly-written Account entries
+        // never go through SDK initialisation — they sit in the
+        // snapshot source's cache, served on-demand by the next
+        // `getLedgerEntries` (the basis of JS-SDK's `getAccount`).
+        //
+        // Each account also gets a USDC trustline so DEX scenarios
+        // (XLM→USDC on Phoenix / Soroswap) work straight away —
+        // without one, the SAC fails to credit the account with
+        // `Error(Contract, #13) "trustline missing"`. This is the
+        // same shape `ChangeTrust` writes on real mainnet, just
+        // bootstrapped at fork time. Not a workaround: it's the
+        // honest representation of "this test account holds USDC".
+        let test_accounts = test_accounts::generate(self.test_account_count);
+        if !test_accounts.is_empty() {
+            let trustline_count = self.test_trustlines.len();
+            let mut preloads: Vec<(
+                soroban_env_host::xdr::LedgerKey,
+                soroban_env_host::xdr::LedgerEntry,
+                Option<u32>,
+            )> = Vec::with_capacity(test_accounts.len() * (1 + trustline_count));
+            for a in &test_accounts {
+                let (key, entry) = a.ledger_entry(sequence);
+                preloads.push((key, entry, None));
+                for asset in &self.test_trustlines {
+                    let (tl_key, tl_entry) = a.trustline_entry(asset.clone(), sequence);
+                    preloads.push((tl_key, tl_entry, None));
+                }
+            }
+            source_rc.preload(preloads);
+            info!(
+                "soroban-fork: minted {} pre-funded test account{} \
+                 ({} trustline{} each)",
+                test_accounts.len(),
+                if test_accounts.len() == 1 { "" } else { "s" },
+                trustline_count,
+                if trustline_count == 1 { "" } else { "s" }
+            );
+        }
+
         Ok(ForkedEnv {
             env,
             source: source_rc,
@@ -630,6 +744,7 @@ impl ForkConfig {
             network_id,
             protocol_version,
             fee_configuration: OnceCell::new(),
+            test_accounts,
         })
     }
 }

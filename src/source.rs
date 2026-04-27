@@ -30,8 +30,8 @@ use std::sync::{Arc, Mutex};
 use log::{info, warn};
 use soroban_env_host::storage::{EntryWithLiveUntil, SnapshotSource};
 use soroban_env_host::xdr::{
-    ContractDataDurability, LedgerEntry, LedgerKey, Limits, PublicKey, ReadXdr, ScAddress, ScVal,
-    WriteXdr,
+    AccountId, ContractDataDurability, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyAccount,
+    Limits, PublicKey, ReadXdr, ScAddress, ScVal, SequenceNumber, WriteXdr,
 };
 use soroban_env_host::HostError;
 
@@ -123,6 +123,41 @@ impl RpcSnapshotSource {
     /// shows up here). Useful for asserting cache hit-rates in tests.
     pub fn fetch_count(&self) -> u32 {
         self.fetch_count.load(Ordering::Relaxed)
+    }
+
+    /// Bump the `seq_num` of an Account ledger entry that's already
+    /// in the cache. Returns the new sequence on success, `None` if
+    /// the account isn't cached or the cached entry isn't an
+    /// `AccountEntry` (so the caller can decide whether absence is
+    /// an error or just "first send from a never-touched account").
+    ///
+    /// Stellar's transaction validation expects `tx.seq_num ==
+    /// account.seq_num + 1` and post-success leaves the account at
+    /// `tx.seq_num`. The fork's trust mode skips the pre-check but
+    /// still must increment so the *next* envelope a JS-SDK client
+    /// builds (via `getAccount` → `tx.seq_num + 1`) lines up with
+    /// what the host expects.
+    pub fn bump_account_seq(&self, account_id: &AccountId) -> Option<i64> {
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        let mut cache = self.cache.lock().expect("cache mutex poisoned");
+        let cached = cache.get_mut(&key)?;
+        let bytes_and_ttl = cached.as_mut()?;
+        let bytes = &bytes_and_ttl.0;
+        let mut entry = LedgerEntry::from_xdr(bytes, Limits::none()).ok()?;
+        let new_seq = match &mut entry.data {
+            LedgerEntryData::Account(account) => {
+                let SequenceNumber(current) = account.seq_num;
+                let next = current.wrapping_add(1);
+                account.seq_num = SequenceNumber(next);
+                next
+            }
+            _ => return None,
+        };
+        let new_bytes = entry.to_xdr(Limits::none()).ok()?;
+        bytes_and_ttl.0 = new_bytes;
+        Some(new_seq)
     }
 
     /// Apply a batch of `LedgerEntryChange`s back to the cache so that
