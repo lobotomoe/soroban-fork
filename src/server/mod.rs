@@ -40,8 +40,9 @@
 //! Deferred to v0.6 / v0.8 / v0.9:
 //! - `sendTransaction`, `getTransaction` — landed in v0.6
 //! - `fork_setLedgerEntry`, `fork_closeLedgers` — landed in v0.8
-//! - `getEvents`, snapshot/revert, ergonomic wrappers (`setBalance`,
-//!   `setCode`, `impersonate`) — pending
+//! - `fork_setStorage` — landed in v0.8.2
+//! - `getEvents`, snapshot/revert, ergonomic wrappers (`fork_setBalance`,
+//!   `fork_setCode`, `fork_impersonate`) — pending
 //!
 //! # Architecture
 //!

@@ -436,6 +436,48 @@ pub(crate) struct CloseLedgersResponse {
     pub(crate) new_close_time: String,
 }
 
+/// `fork_setStorage` request: write a value into a contract's
+/// storage at the given key. Sugar over `fork_setLedgerEntry` —
+/// the handler builds the `LedgerKey::ContractData` +
+/// `LedgerEntry::ContractData` from these fields and routes to
+/// the same primitive.
+///
+/// - `contract`: strkey ("C...") of the contract whose storage
+///   you're writing.
+/// - `key`: base64-XDR `ScVal` of the storage key (what the
+///   contract reads with `storage().persistent().get(&key)` or
+///   `storage().temporary().get(&key)`).
+/// - `value`: base64-XDR `ScVal` of the value to install.
+/// - `durability`: `"persistent"` (default) or `"temporary"`.
+///   Most contract storage is persistent; `Env::storage().temporary()`
+///   in the SDK is the temporary case.
+/// - `liveUntilLedgerSeq`: optional TTL hint. The host on real
+///   mainnet enforces TTL via auto-archival; `soroban-fork` does
+///   not yet model expiry, but we honor the field so receipts
+///   look right and a future TTL pass has the data.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetStorageParams {
+    pub(crate) contract: String,
+    pub(crate) key: String,
+    pub(crate) value: String,
+    #[serde(default)]
+    pub(crate) durability: Option<StorageDurability>,
+    #[serde(default)]
+    pub(crate) live_until_ledger_seq: Option<u32>,
+}
+
+/// Wire encoding for `ContractDataDurability`. Matches the strings
+/// `getLedgerEntries` already uses in the response key-display
+/// (`"persistent"` / `"temporary"`).
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum StorageDurability {
+    #[default]
+    Persistent,
+    Temporary,
+}
+
 /// `getTransaction` response — receipt for a previously-applied tx.
 ///
 /// Field set is a deliberate subset of Stellar's wire shape: we

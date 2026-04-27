@@ -1117,11 +1117,7 @@ async fn server_fork_set_ledger_entry_round_trips() {
     )
     .await;
     let entries = post["result"]["entries"].as_array().unwrap();
-    assert_eq!(
-        entries.len(),
-        1,
-        "the fork-written entry must be visible"
-    );
+    assert_eq!(entries.len(), 1, "the fork-written entry must be visible");
 
     // Decode the returned entry's value and confirm exact match.
     let returned_xdr_b64 = entries[0]["xdr"].as_str().unwrap();
@@ -1199,6 +1195,136 @@ async fn server_fork_close_ledgers_advances_ledger() {
         after_one_more,
         new_seq + 1,
         "no-arg fork_closeLedgers should default to 1 ledger"
+    );
+
+    running.shutdown().await.expect("shutdown");
+}
+
+/// `fork_setStorage` is sugar over `fork_setLedgerEntry` for the
+/// common "write a ScVal into a contract's storage" case. The
+/// handler builds the `LedgerKey::ContractData` +
+/// `LedgerEntry::ContractData` server-side from a strkey contract
+/// + key/value ScVal. This test verifies the full pipeline: the
+/// handler XDR-encodes correctly, the actor installs the entry,
+/// and a follow-up `getLedgerEntries` returns the exact value
+/// the client provided.
+///
+/// Why this matters: the primitive `fork_setLedgerEntry` requires
+/// the client to construct LedgerEntry XDR (multi-level enum
+/// nesting, easy to get wrong). `fork_setStorage` is the
+/// "demonstrably useful" wrapper most tests / demos will reach for
+/// — oracle prices, contract storage overrides, etc. Also unblocks
+/// `examples/blend_liquidation.rs`, which needs to push the BLND
+/// oracle price to make a known-leveraged position underwater.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
+async fn server_fork_set_storage_writes_contract_data() {
+    use soroban_env_host::xdr::LedgerEntryData;
+
+    let (url, running) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Inputs as a JS-SDK client would build them: contract strkey,
+    // inner key + value as base64-XDR ScVals.
+    let inner_key = ScVal::Symbol(ScSymbol("forktest_sugar".try_into().unwrap()));
+    let target_value = ScVal::I128(Int128Parts {
+        hi: 0,
+        lo: 99_999_999,
+    });
+    let key_b64 = BASE64.encode(inner_key.to_xdr(Limits::none()).unwrap());
+    let value_b64 = BASE64.encode(target_value.to_xdr(Limits::none()).unwrap());
+
+    // Sugar call — no XDR-LedgerEntry wrangling on the client side.
+    let set_resp = jsonrpc_call(
+        &client,
+        &url,
+        "fork_setStorage",
+        serde_json::json!({
+            "contract": XLM_SAC,
+            "key": key_b64,
+            "value": value_b64,
+            "durability": "persistent",
+            "liveUntilLedgerSeq": 999_999_999u32,
+        }),
+    )
+    .await;
+    assert_eq!(set_resp["result"]["ok"], true);
+    assert!(set_resp["result"]["latestLedger"].as_u64().unwrap() > 0);
+
+    // Verify the entry is installed by reading it back through
+    // `getLedgerEntries` — the server-built LedgerKey must round-trip.
+    let xlm_id = decode_contract_id(XLM_SAC);
+    let lookup_key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: ScAddress::Contract(ContractId(Hash(xlm_id))),
+        key: ScVal::Symbol(ScSymbol("forktest_sugar".try_into().unwrap())),
+        durability: ContractDataDurability::Persistent,
+    });
+    let lookup_b64 = BASE64.encode(lookup_key.to_xdr(Limits::none()).unwrap());
+
+    let read = jsonrpc_call(
+        &client,
+        &url,
+        "getLedgerEntries",
+        serde_json::json!({ "keys": [lookup_b64] }),
+    )
+    .await;
+    let entries = read["result"]["entries"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "fork_setStorage-written entry must be visible via getLedgerEntries"
+    );
+
+    let returned_xdr_b64 = entries[0]["xdr"].as_str().unwrap();
+    let returned_bytes = BASE64.decode(returned_xdr_b64).unwrap();
+    let returned_data = LedgerEntryData::from_xdr(returned_bytes, Limits::none()).expect("decode");
+    let returned_val = match returned_data {
+        LedgerEntryData::ContractData(cd) => cd.val,
+        other => panic!("expected ContractData, got {other:?}"),
+    };
+    assert_eq!(
+        returned_val, target_value,
+        "the value the client wrote must round-trip verbatim"
+    );
+
+    // Default durability (omitted) must equal "persistent" — the
+    // common case, and the SDK's `storage().persistent()` default
+    // for most contracts.
+    let inner_key_default = ScVal::Symbol(ScSymbol("forktest_default".try_into().unwrap()));
+    let key_default_b64 = BASE64.encode(inner_key_default.to_xdr(Limits::none()).unwrap());
+    let default_resp = jsonrpc_call(
+        &client,
+        &url,
+        "fork_setStorage",
+        serde_json::json!({
+            "contract": XLM_SAC,
+            "key": key_default_b64,
+            "value": value_b64,
+        }),
+    )
+    .await;
+    assert_eq!(
+        default_resp["result"]["ok"], true,
+        "fork_setStorage with no durability field should default to persistent"
+    );
+
+    let lookup_default_key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: ScAddress::Contract(ContractId(Hash(xlm_id))),
+        key: ScVal::Symbol(ScSymbol("forktest_default".try_into().unwrap())),
+        durability: ContractDataDurability::Persistent,
+    });
+    let lookup_default_b64 = BASE64.encode(lookup_default_key.to_xdr(Limits::none()).unwrap());
+    let read_default = jsonrpc_call(
+        &client,
+        &url,
+        "getLedgerEntries",
+        serde_json::json!({ "keys": [lookup_default_b64] }),
+    )
+    .await;
+    assert_eq!(
+        read_default["result"]["entries"].as_array().unwrap().len(),
+        1,
+        "default-durability entry must be visible at the persistent key"
     );
 
     running.shutdown().await.expect("shutdown");

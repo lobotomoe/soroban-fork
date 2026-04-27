@@ -20,8 +20,9 @@ use crate::server::types::{
     GetLedgersParams, GetLedgersResponse, GetTransactionParams, GetTransactionResponse,
     HealthResponse, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LatestLedgerResponse,
     LedgerEntryItem, LedgerInfo, NetworkResponse, SendTransactionParams, SendTransactionResponse,
-    SetLedgerEntryParams, SetLedgerEntryResponse, SimulateHostFunctionResult,
-    SimulateTransactionParams, SimulateTransactionResponse, SimulationCost, VersionInfoResponse,
+    SetLedgerEntryParams, SetLedgerEntryResponse, SetStorageParams, SimulateHostFunctionResult,
+    SimulateTransactionParams, SimulateTransactionResponse, SimulationCost, StorageDurability,
+    VersionInfoResponse,
 };
 
 /// Shared HTTP-layer state. Cheap to clone (the actor handle clones an
@@ -84,6 +85,7 @@ async fn dispatch(
         "sendTransaction" => handle_send_transaction(state, &req.params).await,
         "getTransaction" => handle_get_transaction(state, &req.params).await,
         "fork_setLedgerEntry" => handle_fork_set_ledger_entry(state, &req.params).await,
+        "fork_setStorage" => handle_fork_set_storage(state, &req.params).await,
         "fork_closeLedgers" => handle_fork_close_ledgers(state, &req.params).await,
         unknown => {
             warn!("soroban-fork: unsupported RPC method: {unknown}");
@@ -622,6 +624,97 @@ async fn handle_fork_set_ledger_entry(
         .send(|tx| Command::SetLedgerEntry {
             key,
             entry,
+            live_until: parsed.live_until_ledger_seq,
+            reply: tx,
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    let latest = state
+        .actor
+        .send(|tx| Command::GetLatestLedger { reply: tx })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    let body = SetLedgerEntryResponse {
+        ok: true,
+        latest_ledger: latest.sequence,
+    };
+    serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+}
+
+/// `fork_setStorage` — sugar over `fork_setLedgerEntry` for the
+/// common case of writing a value into a contract's storage.
+///
+/// The handler builds the `LedgerKey::ContractData` +
+/// `LedgerEntry::ContractData` server-side from the inputs
+/// (contract strkey + key/value ScVal + durability), then routes
+/// to the same `Command::SetLedgerEntry` the primitive uses. No
+/// new actor command — the worker does not need to know whether
+/// the entry came from the primitive or this wrapper.
+///
+/// `last_modified_ledger_seq` is set to `0`. The host treats it as
+/// metadata for caching (the same `getLedgerEntries` response
+/// surfaces this value back), and it doesn't affect any host-side
+/// decisions during simulation. Setting to `0` keeps the wrapper
+/// honest about being synthesised — there's no real ledger close
+/// behind this write.
+async fn handle_fork_set_storage(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    use soroban_env_host::xdr::{
+        ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash, LedgerEntry,
+        LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyContractData, ScAddress, ScVal,
+    };
+
+    let parsed: SetStorageParams = serde_json::from_value(params.clone())
+        .map_err(|e| JsonRpcError::invalid_params(format!("fork_setStorage params: {e}")))?;
+
+    let contract_strkey = stellar_strkey::Contract::from_string(&parsed.contract).map_err(|e| {
+        JsonRpcError::invalid_params(format!("contract: not a valid C... strkey: {e}"))
+    })?;
+    let contract_address = ScAddress::Contract(ContractId(Hash(contract_strkey.0)));
+
+    let key_bytes = BASE64
+        .decode(&parsed.key)
+        .map_err(|e| JsonRpcError::invalid_params(format!("key: base64 decode: {e}")))?;
+    let key_scval = ScVal::from_xdr(&key_bytes, Limits::none())
+        .map_err(|e| JsonRpcError::invalid_params(format!("key: ScVal XDR decode: {e}")))?;
+
+    let value_bytes = BASE64
+        .decode(&parsed.value)
+        .map_err(|e| JsonRpcError::invalid_params(format!("value: base64 decode: {e}")))?;
+    let value_scval = ScVal::from_xdr(&value_bytes, Limits::none())
+        .map_err(|e| JsonRpcError::invalid_params(format!("value: ScVal XDR decode: {e}")))?;
+
+    let durability = match parsed.durability.unwrap_or_default() {
+        StorageDurability::Persistent => ContractDataDurability::Persistent,
+        StorageDurability::Temporary => ContractDataDurability::Temporary,
+    };
+
+    let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: contract_address.clone(),
+        key: key_scval.clone(),
+        durability,
+    });
+    let ledger_entry = LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_address,
+            key: key_scval,
+            durability,
+            val: value_scval,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    state
+        .actor
+        .send(|tx| Command::SetLedgerEntry {
+            key: ledger_key,
+            entry: ledger_entry,
             live_until: parsed.live_until_ledger_seq,
             reply: tx,
         })
