@@ -857,7 +857,22 @@ async fn handle_fork_set_balance(
         })?;
     let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_strkey.0)));
 
-    // ---- Amount string -> i64 ----
+    let asset_wire = parsed.asset.unwrap_or(AssetWire::Native(
+        crate::server::types::NativeMarker::Native,
+    ));
+
+    // ---- Soroban-token path (v0.8.7) is structurally different ----
+    // Classic assets RMW a LedgerEntry directly. Soroban tokens are
+    // contracts; their balance lives in their own internal storage
+    // and the only honest way to mutate is to invoke the token's
+    // SEP-41 mint/burn (with trust-mode auth bypassing admin checks).
+    // Dispatch separately and return — keeps the Classic path below
+    // unchanged.
+    if let AssetWire::Contract { contract } = &asset_wire {
+        return handle_set_token_balance(state, account_id, &parsed.amount, contract).await;
+    }
+
+    // ---- Amount string -> i64 (Classic assets fit in i64 stroops) ----
     let amount: i64 = parsed.amount.parse().map_err(|e| {
         JsonRpcError::invalid_params(format!(
             "amount: not a valid i64 decimal string ({e}): {:?}",
@@ -873,10 +888,8 @@ async fn handle_fork_set_balance(
     // Build the LedgerKey for the entry we're going to write.
     // Native uses LedgerKey::Account; credit uses LedgerKey::Trustline.
     // For credit we also need the parsed TrustLineAsset for both the
-    // key and (on auto-create) the new entry.
-    let asset_wire = parsed.asset.unwrap_or(AssetWire::Native(
-        crate::server::types::NativeMarker::Native,
-    ));
+    // key and (on auto-create) the new entry. Contract was already
+    // dispatched above.
     let (lookup_key, trustline_asset_for_create) = match &asset_wire {
         AssetWire::Native(_) => (
             LedgerKey::Account(LedgerKeyAccount {
@@ -928,6 +941,8 @@ async fn handle_fork_set_balance(
                 Some(trustline_asset),
             )
         }
+        // Already early-returned above; arm exists for exhaustiveness.
+        AssetWire::Contract { .. } => unreachable!("Contract dispatched separately above"),
     };
 
     // ---- Read existing entry (if any) ----
@@ -1012,6 +1027,10 @@ async fn handle_fork_set_balance(
                 "internal: credit asset without trustline-asset construction (bug)",
             ));
         }
+        // Already early-returned above; arm exists for exhaustiveness.
+        (AssetWire::Contract { .. }, _, _) => {
+            unreachable!("Contract dispatched separately above")
+        }
     };
 
     state
@@ -1031,6 +1050,220 @@ async fn handle_fork_set_balance(
         latest_ledger: existing.latest_ledger,
     };
     serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+}
+
+/// `fork_setBalance` Soroban-token path (v0.8.7). Sets an account's
+/// balance for a token whose state lives inside a contract (any
+/// SEP-41-shaped contract: SAC for Classic assets, custom Soroban
+/// tokens like BLND, USDC SAC routed through Trustlines, etc.).
+///
+/// Flow:
+/// 1. Simulate `token.balance(account)` → current i128 balance.
+///    Recording-mode simulation; no state change yet.
+/// 2. Compute `delta = amount - current`. Zero-delta is a no-op
+///    (saves a `sendTransaction` round-trip).
+/// 3. Send `mint(to, delta)` (delta > 0) or `burn(from, |delta|)`
+///    (delta < 0) via the existing `Command::SendTransaction`
+///    path. Trust-mode auth (`Recording(false)`) bypasses the
+///    SAC's admin / token's authorisation checks — the fork
+///    accepts the operation regardless of signatures.
+///
+/// Source account for the mint/burn envelope: all-zeros ed25519
+/// pubkey. The host doesn't enforce the source's existence in
+/// trust mode; the receipt's seq-num bump silently no-ops for a
+/// non-cached account (logged at debug). This keeps the handler
+/// from depending on `test_accounts` and works on any fork —
+/// including ones started with `--accounts 0`.
+async fn handle_set_token_balance(
+    state: &AppState,
+    to_account: soroban_env_host::xdr::AccountId,
+    amount_str: &str,
+    contract_strkey: &str,
+) -> Result<serde_json::Value, JsonRpcError> {
+    use soroban_env_host::xdr::{
+        AccountId, ContractId, Hash, HostFunction, Int128Parts, InvokeContractArgs,
+        InvokeHostFunctionOp, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+        PublicKey, ScAddress, ScSymbol, ScVal, SequenceNumber, Transaction, TransactionEnvelope,
+        TransactionExt, TransactionV1Envelope, Uint256,
+    };
+
+    // ---- Parse inputs ----
+    let target_amount: i128 = amount_str.parse().map_err(|e| {
+        JsonRpcError::invalid_params(format!(
+            "amount: not a valid i128 decimal string ({e}): {amount_str:?}"
+        ))
+    })?;
+    if target_amount < 0 {
+        return Err(JsonRpcError::invalid_params(format!(
+            "amount: must be >= 0, got {target_amount}"
+        )));
+    }
+
+    let contract_parsed = stellar_strkey::Contract::from_string(contract_strkey).map_err(|e| {
+        JsonRpcError::invalid_params(format!("asset.contract: not a valid C... strkey: {e}"))
+    })?;
+    let contract_address = ScAddress::Contract(ContractId(Hash(contract_parsed.0)));
+    let to_address = ScAddress::Account(to_account.clone());
+
+    let zero_source = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])));
+
+    // ---- Step 1: simulate balance(to) -> current i128 ----
+    let balance_fn = HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: contract_address.clone(),
+        function_name: ScSymbol(
+            "balance"
+                .try_into()
+                .expect("'balance' fits in 32-char ScSymbol"),
+        ),
+        args: vec![ScVal::Address(to_address.clone())]
+            .try_into()
+            .expect("single-arg vec into VecM"),
+    });
+    let sim_reply = state
+        .actor
+        .send(|tx| Command::SimulateTransaction {
+            host_function: balance_fn,
+            source_account: zero_source.clone(),
+            // We don't care about the fee number for our internal
+            // call — the wire response doesn't surface it.
+            transaction_size_bytes: 0,
+            reply: tx,
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+    let current_balance: i128 = match sim_reply.result {
+        Ok(ScVal::I128(Int128Parts { hi, lo })) => ((hi as i128) << 64) | (lo as i128),
+        Ok(ScVal::U64(_) | ScVal::U32(_) | ScVal::I32(_) | ScVal::I64(_)) => {
+            return Err(JsonRpcError::invalid_params(format!(
+                "asset.contract: token's balance() returned a non-i128 ScVal — \
+                 not a SEP-41-shaped token. Got: {:?}",
+                sim_reply.result
+            )));
+        }
+        Ok(other) => {
+            return Err(JsonRpcError::invalid_params(format!(
+                "asset.contract: token's balance() returned unexpected ScVal type: {other:?}"
+            )));
+        }
+        Err(e) => {
+            return Err(JsonRpcError::invalid_params(format!(
+                "asset.contract: token's balance() simulation failed: {e}. \
+                 Is the contract a SEP-41-shaped token? Does the account exist?"
+            )));
+        }
+    };
+
+    let delta = target_amount - current_balance;
+    if delta == 0 {
+        // No mint/burn needed — already at target. Return success
+        // with the current latest_ledger so the caller sees a real
+        // ledger metadata update.
+        let body = SetBalanceResponse {
+            ok: true,
+            latest_ledger: sim_reply.latest_ledger,
+        };
+        return serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()));
+    }
+
+    // ---- Step 2: build mint(to, delta) or burn(from, |delta|) envelope ----
+    let (fn_name, fn_args) = if delta > 0 {
+        // Mint TO the user's account.
+        let delta_scval = i128_to_scval(delta);
+        (
+            "mint",
+            vec![ScVal::Address(to_address.clone()), delta_scval],
+        )
+    } else {
+        // Burn FROM the user's account. SEP-41 burn signature is
+        // `burn(from: Address, amount: i128)`. Delta is negative;
+        // pass the absolute value.
+        let abs_delta = delta
+            .checked_abs()
+            .ok_or_else(|| JsonRpcError::invalid_params("amount: i128::MIN delta unreachable"))?;
+        let delta_scval = i128_to_scval(abs_delta);
+        ("burn", vec![ScVal::Address(to_address), delta_scval])
+    };
+
+    let mutate_fn = HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address,
+        function_name: ScSymbol(
+            fn_name
+                .try_into()
+                .expect("fn name fits in 32-char ScSymbol"),
+        ),
+        args: fn_args.try_into().expect("two-arg vec into VecM"),
+    });
+
+    // Synthesise a minimal envelope wrapping the mutate call. The
+    // worker stores `envelope_bytes` on the receipt — needed so
+    // the call hashes consistently and `getTransaction` round-trips.
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: mutate_fn.clone(),
+            auth: vec![]
+                .try_into()
+                .expect("empty vec into VecM<SorobanAuthorizationEntry>"),
+        }),
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+        fee: 0,
+        seq_num: SequenceNumber(0),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().expect("single-op vec into VecM"),
+        ext: TransactionExt::V0,
+    };
+    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: vec![].try_into().expect("empty signatures vec into VecM"),
+    });
+    let envelope_bytes = envelope
+        .to_xdr(soroban_env_host::xdr::Limits::none())
+        .map_err(|e| JsonRpcError::internal_error(format!("encode synthetic envelope: {e}")))?;
+
+    // ---- Step 3: send the mint/burn ----
+    let send_reply = state
+        .actor
+        .send(|tx| Command::SendTransaction {
+            envelope_bytes,
+            host_function: mutate_fn,
+            source_account: zero_source,
+            reply: tx,
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    if let Err(msg) = &send_reply.receipt.result {
+        return Err(JsonRpcError::invalid_params(format!(
+            "token {fn_name}({delta}) failed: {msg}. Is the contract SEP-41-shaped \
+             with public mint/burn? Trust-mode auth bypasses admin checks but the \
+             function must still exist and accept (Address, i128)."
+        )));
+    }
+
+    let latest = state
+        .actor
+        .send(|tx| Command::GetLatestLedger { reply: tx })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))?;
+
+    let body = SetBalanceResponse {
+        ok: true,
+        latest_ledger: latest.sequence,
+    };
+    serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+}
+
+/// Encode an `i128` as the XDR `ScVal::I128` shape. Soroban splits
+/// the 128-bit integer into a high `i64` and low `u64` half;
+/// signed-arithmetic-aware shift since the high half preserves sign.
+fn i128_to_scval(n: i128) -> soroban_env_host::xdr::ScVal {
+    use soroban_env_host::xdr::{Int128Parts, ScVal};
+    let hi: i64 = (n >> 64) as i64;
+    let lo: u64 = (n & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+    ScVal::I128(Int128Parts { hi, lo })
 }
 
 /// `fork_etch` — Foundry's `vm.etch`-equivalent. Hot-swap the WASM

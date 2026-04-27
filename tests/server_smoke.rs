@@ -1916,6 +1916,136 @@ async fn server_fork_etch_installs_callable_contract_in_one_call() {
     running.shutdown().await.expect("shutdown");
 }
 
+/// `fork_setBalance` Soroban-token path (v0.8.7) — completes the
+/// `deal()`-equivalent surface by handling tokens whose balance
+/// lives in contract storage rather than a Classic ledger entry.
+///
+/// Flow under test:
+/// 1. Pre-funded test account starts with USDC trustline at 0.
+/// 2. `fork_setBalance` with `asset: { contract: USDC_SAC }` and
+///    amount = 1000 USDC → handler simulates `balance()`, computes
+///    delta = 10_000_000_000 stroops, sends `mint(to, delta)` via
+///    SAC. Trust-mode auth bypasses the issuer admin check.
+/// 3. Verify simulated `balance(to)` now returns 10_000_000_000.
+/// 4. `fork_setBalance` to lower target (500 USDC) → handler routes
+///    through the burn branch (delta < 0). Verify balance drops.
+///
+/// Why this matters: mainnet USDC SAC routes its Soroban-side
+/// `balance` lookup through the Classic AlphaNum4 trustline. The
+/// v0.8.4 credit-asset path covered that case directly (write the
+/// trustline). The Soroban-token path is the *general* solution —
+/// it works for any SEP-41 token regardless of whether the balance
+/// lives in a trustline (mainnet USDC SAC) or contract storage
+/// (custom Soroban tokens like BLND, AQUA, etc.).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
+async fn server_fork_set_balance_soroban_token_path() {
+    use soroban_fork::test_accounts;
+
+    /// 7-decimal USDC scaling — matches the v0.8.4 test convention.
+    const UNIT: i64 = 10_000_000;
+
+    let (url, running) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let account_0 = &test_accounts::generate(1)[0];
+    let account_strkey = account_0.account_strkey();
+    let usdc_sac_id = decode_contract_id(USDC_SAC);
+    let usdc_sac_addr = ScAddress::Contract(ContractId(Hash(usdc_sac_id)));
+    let to_address = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        account_0.public_key,
+    ))));
+
+    // ---- Phase 1: mint 1000 USDC via the Soroban-token path ----
+    let target_amount: i64 = 1_000 * UNIT;
+    let resp = jsonrpc_call(
+        &client,
+        &url,
+        "fork_setBalance",
+        serde_json::json!({
+            "account": account_strkey,
+            "amount": target_amount.to_string(),
+            "asset": { "contract": USDC_SAC },
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["ok"], true,
+        "fork_setBalance soroban-token mint must succeed: {resp:#}"
+    );
+
+    // Verify via simulated USDC.balance(to) — proves the mint took
+    // effect through the SAC's normal balance lookup path.
+    let balance_after_mint = simulate_token_balance(&client, &url, usdc_sac_id, &to_address).await;
+    assert_eq!(
+        balance_after_mint, target_amount as i128,
+        "USDC.balance(to) after mint must match the amount we set"
+    );
+
+    // ---- Phase 2: lower target → exercises the burn branch ----
+    let lower_target: i64 = 500 * UNIT;
+    let resp = jsonrpc_call(
+        &client,
+        &url,
+        "fork_setBalance",
+        serde_json::json!({
+            "account": account_strkey,
+            "amount": lower_target.to_string(),
+            "asset": { "contract": USDC_SAC },
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["ok"], true,
+        "fork_setBalance soroban-token burn must succeed: {resp:#}"
+    );
+
+    let balance_after_burn = simulate_token_balance(&client, &url, usdc_sac_id, &to_address).await;
+    assert_eq!(
+        balance_after_burn, lower_target as i128,
+        "USDC.balance(to) after burn must equal the new lower target"
+    );
+
+    // Sanity: usdc_sac_addr is referenced via the contract id
+    // through the simulate helper; this binding keeps the compile
+    // honest if a future refactor splits the helper.
+    let _ = usdc_sac_addr;
+
+    running.shutdown().await.expect("shutdown");
+}
+
+/// Helper for the Soroban-token test: simulate
+/// `token.balance(to_address)` and decode the i128 return value.
+async fn simulate_token_balance(
+    client: &reqwest::Client,
+    url: &str,
+    contract_id: [u8; 32],
+    to_address: &ScAddress,
+) -> i128 {
+    use soroban_env_host::xdr::Int128Parts;
+
+    let resp = simulate_invoke(
+        client,
+        url,
+        contract_id,
+        "balance",
+        vec![ScVal::Address(to_address.clone())],
+    )
+    .await;
+    assert!(
+        resp["result"]["error"].is_null(),
+        "balance() simulation must succeed: {resp:#}"
+    );
+    let xdr = resp["result"]["results"][0]["xdr"]
+        .as_str()
+        .expect("balance xdr present");
+    let scval = ScVal::from_xdr(BASE64.decode(xdr).unwrap(), Limits::none()).expect("decode");
+    match scval {
+        ScVal::I128(Int128Parts { hi, lo }) => ((hi as i128) << 64) | (lo as i128),
+        other => panic!("expected I128 from balance(), got {other:?}"),
+    }
+}
+
 // `dummy_source_account` is referenced from a docstring example only;
 // silence the unused-but-needed-as-sample warning.
 #[allow(dead_code)]

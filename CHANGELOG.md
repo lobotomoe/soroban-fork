@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7] — 2026-04-27
+
+### Added
+- `fork_setBalance` Soroban-token path. Extends v0.8.4's
+  `deal()`-equivalent with a third asset variant
+  `{ contract: "C..." }` that handles tokens whose balance lives in
+  contract state. Handler simulates `balance(account)` to read the
+  current value, then invokes `mint(to, delta)` or
+  `burn(to, |delta|)` on the SEP-41 surface — trust-mode auth
+  bypasses the SAC's admin / token's authorisation checks, so
+  no signatures needed.
+- `amount` for the contract path is parsed as `i128` (Soroban-side
+  precision); Native and Credit paths still parse `i64` (Classic
+  stroops fit). Same wire field, different range per branch.
+- Smoke test exercises both mint (delta > 0) and burn (delta < 0)
+  branches against the live mainnet USDC SAC.
+
+### Notes
+- The `deal()`-equivalent surface is now complete: Native XLM,
+  Credit AlphaNum4/12 (mainnet USDC, EURC, …), and Soroban-native
+  tokens (the SAC for any Classic asset, plus custom Soroban tokens
+  that follow SEP-41) all routable through one wire method.
+
 ## [0.8.6] — 2026-04-27
 
 ### Added
@@ -282,7 +305,8 @@ non-standard extensions, not bare overrides of Stellar RPC methods.
   from a Soroban RPC endpoint. Compatible with the `LedgerSnapshot` JSON
   format (`stellar snapshot create` interop).
 
-[Unreleased]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.6...HEAD
+[Unreleased]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.7...HEAD
+[0.8.7]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.3...v0.8.4

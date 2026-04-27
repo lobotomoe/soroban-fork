@@ -533,21 +533,28 @@ pub(crate) struct SetBalanceParams {
     pub(crate) asset: Option<AssetWire>,
 }
 
-/// Wire encoding for the `asset` field on `fork_setBalance`. Two
+/// Wire encoding for the `asset` field on `fork_setBalance`. Three
 /// shapes:
 /// - `"native"` (string) → XLM, balance lives on `AccountEntry`.
 /// - `{ "code": "USDC", "issuer": "GA5Z..." }` → Classic credit
 ///   asset; balance lives on `TrustLineEntry`. Code length 1–4
 ///   uses AlphaNum4; 5–12 uses AlphaNum12.
+/// - `{ "contract": "C..." }` *(new in v0.8.7)* → Soroban-native
+///   token (any contract that exposes the SEP-41 `balance` /
+///   `mint` / `burn` interface, including the SAC for Classic
+///   assets). Handler queries `balance(to)`, computes the delta,
+///   and invokes `mint(to, delta)` or `burn(to, |delta|)` with
+///   trust-mode auth.
 ///
 /// Untagged so the JSON looks natural (no `"type": "native"`
 /// ceremony). serde tries the variants in order and uses the
-/// first one that matches.
+/// first one that matches by required-field shape.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum AssetWire {
     Native(NativeMarker),
     Credit { code: String, issuer: String },
+    Contract { contract: String },
 }
 
 /// Marker for the `"native"` string variant of `AssetWire`. Using
