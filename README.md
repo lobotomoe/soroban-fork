@@ -333,6 +333,36 @@ is initialized in the test binary. Typical setup:
 RUST_LOG=soroban_fork=info cargo test -- --ignored
 ```
 
+## Examples
+
+Runnable demos against live Stellar mainnet. Each one targets a real
+contract — Blend lending, Phoenix DEX — to show where lazy-fork pays
+off compared to fabricated reserves in a snapshot test.
+
+```sh
+# What does my 50K USDC deposit do to the Blend Fixed pool?
+cargo run --release --example blend_lending
+
+# What's my fill price market-selling 1M XLM into Phoenix?
+cargo run --release --example phoenix_slippage
+```
+
+`MAINNET_RPC_URL` overrides the upstream RPC. Each example prints
+the forked ledger sequence and the number of RPC fetches it triggered.
+
+For server-mode tooling (`@stellar/stellar-sdk`, Stellar Lab,
+Freighter), `examples/server_demo.mjs` shows the JSON-RPC dialect
+working from Node — no npm install, no XDR dance, just `fetch()`:
+
+```sh
+# shell A — start the fork server
+cargo run --release --features server --bin soroban-fork -- \
+    serve --rpc https://soroban-rpc.mainnet.stellar.gateway.fm
+
+# shell B — drive it from Node
+node examples/server_demo.mjs
+```
+
 ## Combining with `stellar snapshot create`
 
 For maximum speed, pre-snapshot known contracts and let `soroban-fork` handle the rest lazily:
