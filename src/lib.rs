@@ -105,8 +105,23 @@ impl ForkedEnv {
         self.source.fetch_count()
     }
 
-    /// Advance both the ledger sequence and timestamp. Soroban equivalent
-    /// of Anvil's `evm_increaseTime` + `evm_mine` in one call.
+    /// Advance the ledger sequence and timestamp that the `Env` reports
+    /// to contracts.
+    ///
+    /// **Not block production.** Unlike Anvil's `evm_mine`, this does
+    /// not process any pending state — there are no pending transactions
+    /// in this model, and no contract code runs as a side effect of the
+    /// warp. It only changes what `env.ledger().sequence_number()` and
+    /// `env.ledger().timestamp()` return on subsequent reads. Use this
+    /// when contract logic conditionally branches on ledger time
+    /// (vesting cliffs, auction windows, oracle staleness checks).
+    ///
+    /// **TTL caveat.** Bumping the sequence past a cached entry's
+    /// `live_until_ledger_seq` does not automatically simulate Soroban's
+    /// archival/restore flow — soroban-fork does not yet model entry
+    /// expiry. Tests that rely on TTL-expiry semantics will see false
+    /// positives (the entry stays "live" past its real-mainnet expiry).
+    /// Tracking issue: <https://github.com/lobotomoe/soroban-fork/issues>.
     pub fn warp(&self, ledgers: u32, seconds: u64) {
         self.env.ledger().with_mut(|info| {
             info.sequence_number += ledgers;

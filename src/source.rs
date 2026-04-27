@@ -76,6 +76,17 @@ pub struct RpcSnapshotSource {
     fetch_mode: FetchMode,
 }
 
+// Compile-time guarantee that the source is `Send + Sync`. Living at
+// module scope (not inside `cfg(test)`) means a future change that
+// reintroduces `Rc`/`RefCell` breaks `cargo build`, not just `cargo test`
+// — the safety net runs in every developer's local edit cycle.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    assert_send::<RpcSnapshotSource>();
+    assert_sync::<RpcSnapshotSource>();
+};
+
 impl RpcSnapshotSource {
     /// Wrap the given RPC client. `Arc` so the source can be cloned cheaply
     /// and shared with other harnesses (e.g. a pre-warmer).
@@ -106,8 +117,10 @@ impl RpcSnapshotSource {
         }
     }
 
-    /// How many RPC round-trips were served through this source since
-    /// creation. Useful for asserting cache hit-rates in tests.
+    /// How many RPC fetches this source has *attempted* since creation
+    /// (counts both successful and failed attempts — the counter
+    /// increments before the network call, so a connect timeout still
+    /// shows up here). Useful for asserting cache hit-rates in tests.
     pub fn fetch_count(&self) -> u32 {
         self.fetch_count.load(Ordering::Relaxed)
     }
@@ -115,15 +128,24 @@ impl RpcSnapshotSource {
     /// Export the cache for persistence. Negative-cache entries (confirmed
     /// missing) are intentionally omitted — they aren't useful across
     /// processes and bloat the on-disk snapshot.
+    ///
+    /// The decode step runs **outside** the cache lock: we snapshot raw
+    /// bytes under the lock, release it, then parse. With a 10k-entry
+    /// fork this avoids blocking concurrent `get` and `fetch` calls for
+    /// the duration of a few-ms parse loop.
     pub fn entries(&self) -> Vec<(LedgerKey, LedgerEntry, Option<u32>)> {
-        self.cache
-            .lock()
-            .expect("cache mutex poisoned")
-            .iter()
-            .filter_map(|(key, val)| {
-                val.as_ref()
-                    .map(|(bytes, live_until)| (key.clone(), decode_entry(bytes), *live_until))
-            })
+        let raw: Vec<(LedgerKey, Vec<u8>, Option<u32>)> = {
+            let cache = self.cache.lock().expect("cache mutex poisoned");
+            cache
+                .iter()
+                .filter_map(|(key, val)| {
+                    val.as_ref()
+                        .map(|(bytes, live_until)| (key.clone(), bytes.clone(), *live_until))
+                })
+                .collect()
+        };
+        raw.into_iter()
+            .map(|(key, bytes, live_until)| (key, decode_entry(&bytes), live_until))
             .collect()
     }
 
@@ -215,10 +237,12 @@ fn encode_entry(entry: &LedgerEntry) -> Vec<u8> {
 
 /// Decode an XDR-encoded `LedgerEntry`.
 ///
-/// Panics if decoding fails. We only ever decode bytes we encoded
-/// ourselves (via `encode_entry` or via `LedgerSnapshot` JSON load) so a
-/// failure here means the cache contents are corrupted — possible memory
-/// issue or a manual edit of the cache file. Either way, not recoverable.
+/// Panics if decoding fails. The bytes always come from `encode_entry`
+/// in this module (RPC fetches and JSON-loaded `LedgerSnapshot` entries
+/// are both routed through `encode_entry` before they hit the cache),
+/// so a failure here means the cache contents are corrupted — memory
+/// damage, a process bug, or someone replaced the bytes externally.
+/// Not recoverable.
 fn decode_entry(bytes: &[u8]) -> LedgerEntry {
     LedgerEntry::from_xdr(bytes, Limits::none()).unwrap_or_else(|e| {
         panic!(
@@ -308,17 +332,6 @@ mod tests {
         ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerEntryExt,
         LedgerKeyConfigSetting,
     };
-
-    /// Compile-time guarantee: the source MUST be `Send + Sync` so it can
-    /// live behind `Arc` and be shared across threads. If a future change
-    /// reintroduces an `Rc` or `RefCell` field, this stops compiling.
-    #[allow(dead_code)]
-    fn _assert_send_sync() {
-        fn assert_send<T: Send>() {}
-        fn assert_sync<T: Sync>() {}
-        assert_send::<RpcSnapshotSource>();
-        assert_sync::<RpcSnapshotSource>();
-    }
 
     fn dummy_client() -> Arc<RpcClient> {
         Arc::new(

@@ -27,10 +27,15 @@ const ERROR_BODY_TRUNCATE_BYTES: usize = 256;
 /// Tuning for the RPC transport layer.
 #[derive(Clone, Debug)]
 pub struct RpcConfig {
-    /// Maximum number of retries for transient failures (network errors,
-    /// HTTP 5xx, HTTP 429). Total attempts is `retries + 1`.
+    /// Maximum number of retries for transient failures: network errors,
+    /// HTTP 408 / 425 / 429, and any 5xx response. Other 4xx codes fail
+    /// fast (they're caller-error, retrying won't help). Total attempts
+    /// is `retries + 1`.
     pub retries: u32,
-    /// Base delay between retries — doubles on each subsequent attempt.
+    /// Base delay between retries. The actual sleep is
+    /// `base * 2^attempt + rand(0..base)` — exponential backoff with
+    /// **full jitter**, so concurrent test runners don't synchronise
+    /// their retries into a thundering herd against a degraded RPC.
     pub base_retry_delay: Duration,
     /// Per-request HTTP timeout. `None` delegates to reqwest's default.
     pub request_timeout: Option<Duration>,

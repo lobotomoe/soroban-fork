@@ -273,10 +273,16 @@ that were lazy-fetched during the test. This means the second run of a test with
 
 ## Limitations
 
-- **No block production**: there's no `evm_mine` equivalent. The ledger timestamp/sequence is fixed at the fork point.
-- **No impersonation**: there's no `vm.prank()`. Use `env.mock_all_auths()` for auth bypassing.
-- **No RPC server**: unlike Anvil, this doesn't expose a JSON-RPC endpoint. It's a library for Rust tests.
-- **Footprint discovery**: Soroban requires declaring the transaction footprint before execution. The fork tool handles this transparently via the recording-mode footprint in the test environment.
+What soroban-fork does NOT yet do — listed up front so nothing surprises you in production:
+
+- **No block production.** `warp_time` / `warp_ledger` only advance the *reported* ledger info; no pending-transaction processing happens (Soroban's model has no mempool to drain anyway, but Anvil-style `evm_mine` semantics do not apply).
+- **No TTL / archival simulation.** Soroban entries carry a `live_until_ledger_seq`; on real mainnet they become archived past that ledger and need a `RestoreFootprint` operation. We track `live_until` in the cache but do not yet model expiry — bumping `env.ledger()` past an entry's `live_until` will not flip it to archived. Tests that depend on TTL-expiry semantics will see false-positives. (Planned for a future release.)
+- **No historical state.** `at_ledger(N)` shifts only what `env.ledger().sequence_number()` reports; the actual ledger entries are always fetched at the RPC's *current* latest. Pin to a specific ledger only when paired with `cache_file` for reproducibility, not when expecting historical state.
+- **No `snapshot()` / `revertTo()`.** Each `ForkedEnv` is a fresh world; there's no in-place state rewind. For per-test isolation, build a fresh env per test. (Planned alongside RPC-server mode where each request gets its own Env naturally.)
+- **No `prank` / `etch` / `mockCall`.** Only `mock_all_auths()` (global) and `deal_token()` (calls real `mint`/`burn`). Selective per-address auth and WASM hot-swap are planned. (Foundry calls these "cheatcodes"; we have one.)
+- **No RPC server.** Unlike Anvil, this doesn't expose a JSON-RPC endpoint — it's a Rust library only. JS/Python/Go SDKs cannot point at a soroban-fork instance today. (Planned flagship feature.)
+- **Tracing renders structure, not metering.** `env.trace()` captures the call tree with decoded args and return values. It does **not** yet render per-frame gas / cost units, contract events, or decoded `HostError` reasons. (Diagnostic events from the host carry call structure but not metering numbers; metering is planned.)
+- **Footprint discovery.** Soroban requires declaring the transaction footprint before execution. The fork tool handles this transparently via the recording-mode footprint in the test environment.
 
 ## Requirements
 
