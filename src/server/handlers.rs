@@ -274,6 +274,16 @@ async fn handle_simulate_transaction(
         soroban_env_host::xdr::TransactionEnvelope::from_xdr(&envelope_bytes, Limits::none())
             .map_err(|e| JsonRpcError::invalid_params(format!("transaction: XDR decode: {e}")))?;
 
+    // Stellar's bandwidth + historical-data fee components depend on
+    // the on-the-wire envelope length. We measure once here so the
+    // worker can fold it into `compute_transaction_resource_fee`.
+    let transaction_size_bytes: u32 = envelope_bytes.len().try_into().map_err(|_| {
+        JsonRpcError::invalid_params(format!(
+            "transaction: envelope too large for u32 ({} bytes)",
+            envelope_bytes.len()
+        ))
+    })?;
+
     // Extract the host function and source account. Only single-op
     // InvokeHostFunction transactions are supported in v0.5; classic
     // operations and multi-op envelopes get a clear `invalid_params`.
@@ -284,6 +294,7 @@ async fn handle_simulate_transaction(
         .send(|tx| Command::SimulateTransaction {
             host_function,
             source_account,
+            transaction_size_bytes,
             reply: tx,
         })
         .await
@@ -394,12 +405,17 @@ fn encode_simulation_reply(reply: SimulationReply) -> Result<serde_json::Value, 
         auth_b64.push(BASE64.encode(&bytes));
     }
 
-    // Build SorobanTransactionData. resourceFee is stubbed at 0; see
-    // the doc comment on `SimulateTransactionResponse::transaction_data`.
+    // Build SorobanTransactionData. The `resourceFee` field on the
+    // wire-format `SorobanTransactionData` is the same number we emit
+    // as the top-level `minResourceFee`; pass it through so signed
+    // envelopes built from this response carry the right declaration.
+    // When the schedule isn't resolvable we fall back to 0 — clients
+    // that care about correctness watch the top-level field.
+    let resource_fee = reply.min_resource_fee.unwrap_or(0);
     let txn_data = SorobanTransactionData {
         ext: SorobanTransactionDataExt::V0,
         resources: reply.resources.clone(),
-        resource_fee: 0,
+        resource_fee,
     };
     let txn_data_xdr = txn_data
         .to_xdr(Limits::none())
@@ -426,24 +442,24 @@ fn encode_simulation_reply(reply: SimulationReply) -> Result<serde_json::Value, 
         events_b64.push(BASE64.encode(&bytes));
     }
 
-    let cost = SimulationCost {
+    // `cost.cpuInsns` is the host-budget instruction count; `cost.memBytes`
+    // is the host-budget memory consumption queried from the same Budget
+    // the invocation ran against. When the failure path hands us no
+    // metering at all, omit the cost block rather than emit zeros.
+    let cost = reply.mem_bytes.map(|mem| SimulationCost {
         cpu_insns: reply.resources.instructions.to_string(),
-        // Memory bytes isn't directly tracked in `SorobanResources`;
-        // `write_bytes` is the closest proxy on the wire. Real Stellar
-        // RPCs return precise numbers from a separate budget snapshot —
-        // we'd need to wire that in v0.5.x.
-        mem_bytes: reply.resources.write_bytes.to_string(),
-    };
+        mem_bytes: mem.to_string(),
+    });
 
     let body = SimulateTransactionResponse {
         transaction_data: Some(BASE64.encode(&txn_data_xdr)),
-        min_resource_fee: Some("0".to_string()),
+        min_resource_fee: reply.min_resource_fee.map(|n| n.to_string()),
         events: Some(events_b64),
         results: Some(vec![SimulateHostFunctionResult {
             auth: auth_b64,
             xdr: BASE64.encode(&scval_xdr),
         }]),
-        cost: Some(cost),
+        cost,
         latest_ledger,
         error: None,
     };

@@ -80,9 +80,17 @@ pub(crate) enum Command {
     /// host observed: result, auth requirements, footprint, events,
     /// budget consumption. Does **not** mutate the env's state (the
     /// host primitive constructs its own throwaway sandbox per call).
+    ///
+    /// `transaction_size_bytes` is the on-the-wire length of the
+    /// `TransactionEnvelope` the handler decoded. The worker needs it
+    /// to compute the bandwidth + historical-data components of
+    /// `minResourceFee`; threading it as a `Command` field keeps fee
+    /// math centralised in the worker (where the live fee schedule
+    /// lives) rather than splitting it across handler and worker.
     SimulateTransaction {
         host_function: HostFunction,
         source_account: AccountId,
+        transaction_size_bytes: u32,
         reply: oneshot::Sender<SimulationReply>,
     },
 }
@@ -149,6 +157,17 @@ pub(crate) struct SimulationReply {
     pub(crate) diagnostic_events: Vec<DiagnosticEvent>,
     /// Echoed `latestLedger` for the response wire shape.
     pub(crate) latest_ledger: u32,
+    /// Resource fee a real `sendTransaction` would owe at the live
+    /// network's fee schedule, summed from non-refundable and
+    /// refundable components. `None` when the schedule could not be
+    /// resolved — the wire response then omits `minResourceFee`
+    /// rather than lying with `"0"`.
+    pub(crate) min_resource_fee: Option<i64>,
+    /// Real memory in bytes the host's budget metered during the
+    /// invocation, queried via `Budget::get_mem_bytes_consumed`.
+    /// `None` only on the recording-mode failure path before any
+    /// metering happened.
+    pub(crate) mem_bytes: Option<u64>,
 }
 
 /// Handle to the worker thread. Cloning is cheap (Arc-style internally
@@ -285,9 +304,15 @@ fn worker_loop(env: crate::ForkedEnv, mut rx: mpsc::Receiver<Command>) {
             Command::SimulateTransaction {
                 host_function,
                 source_account,
+                transaction_size_bytes,
                 reply,
             } => {
-                let _ = reply.send(simulate_transaction(&env, host_function, source_account));
+                let _ = reply.send(simulate_transaction(
+                    &env,
+                    host_function,
+                    source_account,
+                    transaction_size_bytes,
+                ));
             }
         }
     }
@@ -307,6 +332,7 @@ fn simulate_transaction(
     env: &crate::ForkedEnv,
     host_function: HostFunction,
     source_account: AccountId,
+    transaction_size_bytes: u32,
 ) -> SimulationReply {
     use soroban_sdk::testutils::Ledger as _;
 
@@ -336,15 +362,31 @@ fn simulate_transaction(
 
     let latest_ledger = env.ledger_sequence();
 
+    // Memory accounting reads from the same Budget that was just charged
+    // by the host. On the failure path the budget may not have been
+    // exercised; treat that as `None` rather than a misleading 0.
+    let mem_bytes = budget.get_mem_bytes_consumed().ok();
+
     match result {
-        Ok(rec) => SimulationReply {
-            result: rec.invoke_result.map_err(|e| format!("host error: {e}")),
-            auth: rec.auth,
-            resources: rec.resources,
-            contract_events: rec.contract_events,
-            diagnostic_events,
-            latest_ledger,
-        },
+        Ok(rec) => {
+            let invoke_result = rec.invoke_result.map_err(|e| format!("host error: {e}"));
+            let min_resource_fee = compute_min_resource_fee(
+                env,
+                &rec.resources,
+                &rec.contract_events,
+                transaction_size_bytes,
+            );
+            SimulationReply {
+                result: invoke_result,
+                auth: rec.auth,
+                resources: rec.resources,
+                contract_events: rec.contract_events,
+                diagnostic_events,
+                latest_ledger,
+                min_resource_fee,
+                mem_bytes,
+            }
+        }
         Err(e) => {
             // Recording-mode-level error (budget exhaustion). The wire
             // response sets `error` and elides everything else.
@@ -355,9 +397,84 @@ fn simulate_transaction(
                 contract_events: Vec::new(),
                 diagnostic_events,
                 latest_ledger,
+                min_resource_fee: None,
+                mem_bytes,
             }
         }
     }
+}
+
+/// Compute the minimum resource fee a real `sendTransaction` would owe
+/// for this simulation, using the on-chain fee schedule.
+///
+/// Returns `None` when:
+/// - Resolving the live fee schedule failed (RPC error, missing config
+///   setting). The wire response then omits `minResourceFee` rather
+///   than lying with `"0"` or a partial computation.
+/// - Encoding a contract event for size measurement failed (host
+///   internal error; should not happen with well-formed events).
+///
+/// **Slight underestimate by signature size.** The bandwidth +
+/// historical-data fee components scale with the on-the-wire envelope
+/// size, but at simulation time the envelope carries no signatures
+/// yet (the caller can't sign what they're trying to size). Real
+/// `sendTransaction` will pay ~70 bytes × `fee_per_transaction_size_1kb`
+/// extra per signer; clients copying this number into a signed tx
+/// should pad accordingly. Same approximation `stellar-rpc` makes.
+fn compute_min_resource_fee(
+    env: &crate::ForkedEnv,
+    resources: &SorobanResources,
+    contract_events: &[ContractEvent],
+    transaction_size_bytes: u32,
+) -> Option<i64> {
+    use soroban_env_host::xdr::{DiagnosticEvent, Limits, WriteXdr};
+
+    let fee_config = match env.fee_configuration() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!("soroban-fork: minResourceFee skipped — fee schedule unavailable: {e}");
+            return None;
+        }
+    };
+
+    // Stellar core measures contract-events size as the XDR length of
+    // the same `DiagnosticEvent { in_successful_contract_call: true,
+    // event }` wrappers that go on the wire.
+    let mut events_size: u32 = 0;
+    for ce in contract_events {
+        let de = DiagnosticEvent {
+            in_successful_contract_call: true,
+            event: ce.clone(),
+        };
+        match de.to_xdr(Limits::none()) {
+            Ok(bytes) => {
+                events_size = events_size.saturating_add(bytes.len() as u32);
+            }
+            Err(e) => {
+                warn!("soroban-fork: minResourceFee skipped — contract event XDR encode failed: {e}");
+                return None;
+            }
+        }
+    }
+
+    let footprint = &resources.footprint;
+    let read_only_count = footprint.read_only.len() as u32;
+    let read_write_count = footprint.read_write.len() as u32;
+
+    let tx_resources = crate::fees::TransactionResources {
+        instructions: resources.instructions,
+        // Stellar fee math counts every entry the tx touches as "read"
+        // (writes are read-then-written), and writes again as "write".
+        disk_read_entries: read_only_count.saturating_add(read_write_count),
+        write_entries: read_write_count,
+        disk_read_bytes: resources.disk_read_bytes,
+        write_bytes: resources.write_bytes,
+        contract_events_size_bytes: events_size,
+        transaction_size_bytes,
+    };
+    let (non_refundable, refundable) =
+        crate::fees::compute_transaction_resource_fee(&tx_resources, fee_config);
+    Some(non_refundable.saturating_add(refundable))
 }
 
 /// Stand-in resources struct for the failure path. We populate the same

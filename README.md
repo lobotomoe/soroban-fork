@@ -224,8 +224,12 @@ understands the spec.
   - `results[0].xdr` — the function's return value (`ScVal`)
   - `results[0].auth` — auth entries `sendTransaction` would need
   - `transactionData` — `SorobanTransactionData` with recorded footprint
+    and `resourceFee` matching `minResourceFee`
   - `events` — diagnostic events emitted during simulation
-  - `cost.cpuInsns` — real CPU consumed
+  - `cost.cpuInsns` / `cost.memBytes` — real numbers from the host's
+    `Budget`, *not* a `write_bytes` proxy
+  - `minResourceFee` — derived from the live on-chain Soroban fee
+    schedule via `compute_transaction_resource_fee` (since v0.5.2)
   - `latestLedger` — fork's reported ledger
 
 ### What v0.5 server does NOT support
@@ -238,11 +242,11 @@ Listed up front so nothing surprises you:
   during simulation are reachable via `simulateTransaction`'s response.
 - **`anvil_*` cheatcodes** — `snapshot`, `revert`, `impersonate`,
   `setBalance`, `setCode`. Scoped to v0.6 alongside `sendTransaction`.
-- **`minResourceFee`** — currently stubbed as `"0"`. Real fee
-  calculation against the live Stellar fee schedule is a v0.5.x followup.
-- **`memBytes` in `cost`** — not directly tracked in `SorobanResources`;
-  reported as `write_bytes` proxy. Real memory accounting needs a
-  separate budget snapshot wire.
+- *(closed in v0.5.2)* — `minResourceFee` is now computed from the live
+  on-chain fee schedule (the six `ConfigSetting` entries) via the
+  host's own `compute_transaction_resource_fee`, and `cost.memBytes`
+  reports the real `Budget::get_mem_bytes_consumed` reading rather
+  than the previous `write_bytes` proxy.
 
 ### Architecture: single-threaded actor
 
@@ -424,7 +428,7 @@ What soroban-fork does NOT yet do — listed up front so nothing surprises you i
 - **No TTL / archival simulation.** Soroban entries carry a `live_until_ledger_seq`; on real mainnet they become archived past that ledger and need a `RestoreFootprint` operation. We track `live_until` in the cache but do not yet model expiry — bumping `env.ledger()` past an entry's `live_until` will not flip it to archived. Tests that depend on TTL-expiry semantics will see false-positives.
 - **No historical state.** `at_ledger(N)` shifts only what `env.ledger().sequence_number()` reports; the actual ledger entries are always fetched at the RPC's *current* latest. Pin to a specific ledger only when paired with `cache_file` for reproducibility, not when expecting historical state.
 - **Tracing renders structure, not metering.** `env.trace()` captures the call tree with decoded args and return values. It does **not** yet render per-frame gas / cost units, contract events, or decoded `HostError` reasons. (Diagnostic events from the host carry call structure but not metering numbers; metering is planned. Server-mode `simulateTransaction` does return real `cost.cpuInsns` separately.)
-- **Server `simulateTransaction` fee fields are stubbed.** `minResourceFee` is `"0"` and `cost.memBytes` reports `write_bytes` as a proxy. Real fee calculation against the live Stellar fee schedule and proper memory accounting are a v0.5.x followup.
+- ~~**Server `simulateTransaction` fee fields are stubbed.**~~ *(closed in v0.5.2.)* `minResourceFee` is now derived from the live on-chain fee schedule via `compute_transaction_resource_fee`, and `cost.memBytes` reads `Budget::get_mem_bytes_consumed` directly. Bandwidth + historical-data fees use the actual envelope size received over the wire.
 - **Footprint discovery.** Soroban requires declaring the transaction footprint before execution. The fork tool handles this transparently via the recording-mode footprint in the test environment.
 
 ## Requirements

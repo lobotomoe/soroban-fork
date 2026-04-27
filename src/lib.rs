@@ -44,6 +44,7 @@
 
 mod cache;
 mod error;
+pub mod fees;
 mod rpc;
 mod source;
 pub mod trace;
@@ -59,6 +60,7 @@ pub use rpc::{FetchedEntry, LatestLedger, NetworkMetadata, RpcClient, RpcConfig}
 pub use source::{FetchMode, RpcSnapshotSource};
 pub use trace::{Trace, TraceFrame, TraceResult};
 
+use std::cell::OnceCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -94,6 +96,10 @@ pub struct ForkedEnv {
     /// matches its declared network. `None` only when the user
     /// overrode `network_id` and we never had a passphrase to keep.
     passphrase: Option<String>,
+    /// Lazily resolved Soroban resource-fee schedule, sourced from the
+    /// six on-chain `ConfigSetting` entries the first time it's asked
+    /// for and reused thereafter.
+    fee_configuration: OnceCell<fees::FeeConfiguration>,
 }
 
 impl std::ops::Deref for ForkedEnv {
@@ -241,6 +247,34 @@ impl ForkedEnv {
     /// duplicating the lazy-fetch logic in the server module.
     pub fn snapshot_source(&self) -> &Rc<RpcSnapshotSource> {
         &self.source
+    }
+
+    /// The on-chain Soroban resource-fee schedule for this forked
+    /// network, resolved lazily on first call.
+    ///
+    /// Implementation: at first call we fetch the six `ConfigSetting`
+    /// entries that compose the schedule (one upstream-RPC round-trip
+    /// per uncached key, then served from the snapshot cache forever)
+    /// and decode them into a [`fees::FeeConfiguration`]. Subsequent
+    /// calls return the same cached reference.
+    ///
+    /// Used by the JSON-RPC server's `simulateTransaction` to compute
+    /// honest `minResourceFee` numbers; library callers can also
+    /// invoke this directly for fee-projection tests.
+    pub fn fee_configuration(&self) -> Result<&fees::FeeConfiguration> {
+        if let Some(cfg) = self.fee_configuration.get() {
+            return Ok(cfg);
+        }
+        let cfg = fees::fetch_fee_configuration(&self.source)?;
+        // `set` only fails if another thread (or re-entrant call) already
+        // populated the cell. ForkedEnv is `!Send`, so the only way to hit
+        // that path is re-entry from inside `fetch_fee_configuration` —
+        // and the snapshot source there does not call back into us.
+        let _ = self.fee_configuration.set(cfg);
+        Ok(self
+            .fee_configuration
+            .get()
+            .expect("fee_configuration just populated"))
     }
 
     /// Reconstruct the cross-contract call tree from the host's diagnostic
@@ -595,6 +629,7 @@ impl ForkConfig {
             passphrase,
             network_id,
             protocol_version,
+            fee_configuration: OnceCell::new(),
         })
     }
 }

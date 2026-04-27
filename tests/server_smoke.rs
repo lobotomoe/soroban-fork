@@ -235,12 +235,37 @@ async fn server_simulates_xlm_decimals() {
         "transactionData should be a non-empty base64 string"
     );
 
-    // Cost should be reported.
+    // Cost should be reported with REAL host-budget numbers — not the
+    // pre-v0.5.2 stub where memBytes was a write_bytes proxy.
     let cpu_str = resp["result"]["cost"]["cpuInsns"]
         .as_str()
         .expect("cost.cpuInsns");
     let cpu: u64 = cpu_str.parse().expect("cpuInsns parses as u64");
     assert!(cpu > 0, "decimals() should consume non-zero CPU");
+
+    let mem_str = resp["result"]["cost"]["memBytes"]
+        .as_str()
+        .expect("cost.memBytes");
+    let mem: u64 = mem_str.parse().expect("memBytes parses as u64");
+    // `decimals()` is a pure read — `write_bytes` is 0. The pre-v0.5.2
+    // proxy would report 0 here; the real Budget always reports
+    // non-zero memory for any host invocation.
+    assert!(
+        mem > 0,
+        "memBytes should reflect real host memory consumption, got {mem}"
+    );
+
+    // `minResourceFee` should be the live mainnet fee schedule applied
+    // to this transaction — non-zero, fits in i64, sourced from the
+    // six on-chain ConfigSetting entries. The pre-v0.5.2 stub was "0".
+    let fee_str = resp["result"]["minResourceFee"]
+        .as_str()
+        .expect("minResourceFee");
+    let fee: i64 = fee_str.parse().expect("minResourceFee parses as i64");
+    assert!(
+        fee > 0,
+        "minResourceFee should be derived from live fee schedule, got {fee}"
+    );
 
     running.shutdown().await.expect("shutdown");
 }
