@@ -1,6 +1,6 @@
 [package]
 name = "soroban-fork"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Lazy-loading mainnet/testnet fork for Soroban tests — an Anvil-equivalent for Stellar."
@@ -13,11 +13,24 @@ readme = "README.md"
 keywords = ["stellar", "soroban", "testing", "fork", "blockchain"]
 categories = ["development-tools::testing", "simulation"]
 
+[features]
+# Default features = library only. Server-mode users opt in.
+default = []
+
+# Enable the JSON-RPC server (`soroban-fork serve` binary + the `server`
+# module on the library API). Pulls in tokio + axum + tower-http + clap —
+# none of which library-mode users should pay for.
+server = ["dep:tokio", "dep:axum", "dep:tower-http", "dep:clap", "dep:env_logger"]
+
 [dependencies]
 # Pulls in everything we need from the XDR surface (re-exported as
 # `soroban_env_host::xdr`) — avoids keeping a direct `stellar-xdr` dep
 # whose version would have to be pinned in lockstep with the host.
-soroban-env-host = { version = "25.0.1", features = ["testutils"] }
+#
+# `recording_mode` is required for `invoke_host_function_in_recording_mode`,
+# the host primitive that powers `simulateTransaction`. The feature has no
+# transitive dep cost, just unlocks more code paths in env-host.
+soroban-env-host = { version = "25.0.1", features = ["testutils", "recording_mode"] }
 soroban-sdk = { version = "25.3.0", features = ["testutils"] }
 soroban-ledger-snapshot = "25.3.0"
 stellar-strkey = "0.0.16"
@@ -29,7 +42,33 @@ sha2 = "0.10"
 thiserror = "2"
 log = "0.4"
 
+# Server-mode optional deps. Library users (default features) don't see them.
+# `rt-multi-thread` for the HTTP-handler runtime; `sync` for mpsc/oneshot
+# channels carrying commands to the single-threaded Env worker.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"], optional = true }
+axum = { version = "0.7", optional = true }
+tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
+# `derive` for #[derive(Parser)]; `env` for `#[arg(env = "...")]` so the
+# CLI also reads SOROBAN_FORK_RPC etc. from the environment.
+clap = { version = "4", features = ["derive", "env"], optional = true }
+# Used by the CLI binary; pulled in only with the server feature so
+# library users don't incur the dep.
+env_logger = { version = "0.11", optional = true }
+
 [dev-dependencies]
-# Initialized in tests via `.try_init()` so `RUST_LOG=soroban_fork=debug`
-# surfaces fetch traces without every test opting in manually.
 env_logger = "0.11"
+# Used by the server integration tests: tokio runtime + async reqwest
+# for sending JSON-RPC requests at the in-process server. Both gated
+# behind `required-features = ["server"]` on the relevant tests so
+# library-mode test runs don't pay for them.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[[test]]
+name = "server_smoke"
+required-features = ["server"]
+
+[[bin]]
+name = "soroban-fork"
+path = "src/bin/soroban-fork.rs"
+required-features = ["server"]

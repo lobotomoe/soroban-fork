@@ -12,7 +12,7 @@ When a test reads a ledger entry that isn't in the local cache, `soroban-fork` f
 
 ```toml
 [dev-dependencies]
-soroban-fork = "0.4"
+soroban-fork = "0.5"
 ```
 
 ## Usage
@@ -182,6 +182,121 @@ the next call if you need history. See the
 [`trace` module docs](https://docs.rs/soroban-fork/latest/soroban_fork/trace/index.html)
 for wire-format details and caveats (single-`Vec`-arg ambiguity).
 
+## JSON-RPC server mode
+
+Library mode (everything above) is for Rust tests. **Server mode** turns
+soroban-fork into a Stellar Soroban RPC drop-in that any tooling — JS,
+Python, Go SDKs, Stellar Lab, Freighter, custom clients — can point at:
+
+```sh
+cargo install soroban-fork --features server
+soroban-fork serve --rpc https://soroban-rpc.mainnet.stellar.gateway.fm
+# → serving JSON-RPC on http://127.0.0.1:8000
+```
+
+Then any client speaking the Stellar RPC dialect:
+
+```js
+import { SorobanRpc } from "@stellar/stellar-sdk";
+const server = new SorobanRpc.Server("http://localhost:8000");
+const account = await server.getAccount("GA5...");
+const result = await server.simulateTransaction(tx);  // hits the fork
+```
+
+Or via the Rust `stellar-rpc-client`, raw curl, or anything that
+understands the spec.
+
+### Methods supported in v0.5
+
+- **`getHealth`** — fork status + latest ledger
+- **`getVersionInfo`** — server version + protocol version
+- **`getNetwork`** — passphrase + protocol version + network ID (proxied
+  from the upstream RPC at fork-build time, then served locally)
+- **`getLatestLedger`** — fork's reported ledger sequence + protocol
+- **`getLedgers`** — single-element page describing the fork point with
+  real `ledgerCloseTime` (Unix-seconds string, per Stellar convention)
+- **`getLedgerEntries`** — base64-XDR `LedgerKey` array → array of
+  entries; routed through the fork's lazy-fetch cache, so first hit
+  proxies upstream and subsequent hits are local
+- **`simulateTransaction`** — accepts a base64-XDR `TransactionEnvelope`
+  with one `InvokeHostFunctionOp`, runs it via the host's recording-mode
+  primitive, returns:
+  - `results[0].xdr` — the function's return value (`ScVal`)
+  - `results[0].auth` — auth entries `sendTransaction` would need
+  - `transactionData` — `SorobanTransactionData` with recorded footprint
+  - `events` — diagnostic events emitted during simulation
+  - `cost.cpuInsns` — real CPU consumed
+  - `latestLedger` — fork's reported ledger
+
+### What v0.5 server does NOT support
+
+Listed up front so nothing surprises you:
+
+- **`sendTransaction` / `getTransaction`** — state-mutating writes are
+  scoped to v0.6.
+- **`getEvents`** — historical event filtering. Diagnostic events emitted
+  during simulation are reachable via `simulateTransaction`'s response.
+- **`anvil_*` cheatcodes** — `snapshot`, `revert`, `impersonate`,
+  `setBalance`, `setCode`. Scoped to v0.6 alongside `sendTransaction`.
+- **`minResourceFee`** — currently stubbed as `"0"`. Real fee
+  calculation against the live Stellar fee schedule is a v0.5.x followup.
+- **`memBytes` in `cost`** — not directly tracked in `SorobanResources`;
+  reported as `write_bytes` proxy. Real memory accounting needs a
+  separate budget snapshot wire.
+
+### Architecture: single-threaded actor
+
+axum HTTP handlers run on a multi-thread tokio runtime; commands flow
+through a bounded `mpsc` channel to one OS thread that owns the
+`ForkedEnv`. The SDK's `Env` contains `Rc<HostImpl>` and is `!Send`, so
+it can't live behind `Arc<RwLock>` — single-thread ownership with
+explicit messaging is the load-bearing constraint of this design. Same
+trade-off Foundry's Anvil makes for the EVM.
+
+```
+[HTTP handler 1]──┐
+[HTTP handler 2]──┼──mpsc::channel──→ [worker thread] owns ForkedEnv
+[HTTP handler N]──┘                           │
+                                              └─→ snapshot_source.get()
+                                                  └─→ on cache miss → upstream RPC
+```
+
+Cache misses on `getLedgerEntries` block the worker for one upstream
+round-trip. Steady state (after first contact) is local.
+
+### Library API for server mode
+
+If you'd rather embed the server in your own Rust process (CI test
+harness, custom Stellar tooling), use the library API:
+
+```rust,ignore
+use soroban_fork::{ForkConfig, server::Server};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ForkConfig::new("https://soroban-rpc.mainnet.stellar.gateway.fm");
+
+    Server::builder(config)
+        .listen("127.0.0.1:8000".parse().unwrap())
+        .serve()        // runs until SIGINT/SIGTERM
+        .await?;
+
+    Ok(())
+}
+```
+
+For tests that need to bind ephemeral ports and shut down programmatically:
+
+```rust,ignore
+let running = Server::builder(config)
+    .listen("127.0.0.1:0".parse().unwrap())   // OS-assigned port
+    .start()
+    .await?;
+let url = format!("http://{}", running.local_addr());
+// ... drive the server with a real client ...
+running.shutdown().await?;
+```
+
 ### `RpcSnapshotSource`
 
 The core primitive. Implements `soroban_env_host::storage::SnapshotSource`:
@@ -275,13 +390,11 @@ that were lazy-fetched during the test. This means the second run of a test with
 
 What soroban-fork does NOT yet do — listed up front so nothing surprises you in production:
 
-- **No block production.** `warp_time` / `warp_ledger` only advance the *reported* ledger info; no pending-transaction processing happens (Soroban's model has no mempool to drain anyway, but Anvil-style `evm_mine` semantics do not apply).
-- **No TTL / archival simulation.** Soroban entries carry a `live_until_ledger_seq`; on real mainnet they become archived past that ledger and need a `RestoreFootprint` operation. We track `live_until` in the cache but do not yet model expiry — bumping `env.ledger()` past an entry's `live_until` will not flip it to archived. Tests that depend on TTL-expiry semantics will see false-positives. (Planned for a future release.)
+- **No `sendTransaction` / state mutation through RPC.** v0.5's server mode is read+simulate only. Library-mode users can mutate state via `env.invoke_contract` (it's a real `Env` underneath). Server-mode `sendTransaction` plus `anvil_*` cheatcodes (impersonate / setBalance / setCode / snapshot / revert) are planned for v0.6.
+- **No TTL / archival simulation.** Soroban entries carry a `live_until_ledger_seq`; on real mainnet they become archived past that ledger and need a `RestoreFootprint` operation. We track `live_until` in the cache but do not yet model expiry — bumping `env.ledger()` past an entry's `live_until` will not flip it to archived. Tests that depend on TTL-expiry semantics will see false-positives.
 - **No historical state.** `at_ledger(N)` shifts only what `env.ledger().sequence_number()` reports; the actual ledger entries are always fetched at the RPC's *current* latest. Pin to a specific ledger only when paired with `cache_file` for reproducibility, not when expecting historical state.
-- **No `snapshot()` / `revertTo()`.** Each `ForkedEnv` is a fresh world; there's no in-place state rewind. For per-test isolation, build a fresh env per test. (Planned alongside RPC-server mode where each request gets its own Env naturally.)
-- **No `prank` / `etch` / `mockCall`.** Only `mock_all_auths()` (global) and `deal_token()` (calls real `mint`/`burn`). Selective per-address auth and WASM hot-swap are planned. (Foundry calls these "cheatcodes"; we have one.)
-- **No RPC server.** Unlike Anvil, this doesn't expose a JSON-RPC endpoint — it's a Rust library only. JS/Python/Go SDKs cannot point at a soroban-fork instance today. (Planned flagship feature.)
-- **Tracing renders structure, not metering.** `env.trace()` captures the call tree with decoded args and return values. It does **not** yet render per-frame gas / cost units, contract events, or decoded `HostError` reasons. (Diagnostic events from the host carry call structure but not metering numbers; metering is planned.)
+- **Tracing renders structure, not metering.** `env.trace()` captures the call tree with decoded args and return values. It does **not** yet render per-frame gas / cost units, contract events, or decoded `HostError` reasons. (Diagnostic events from the host carry call structure but not metering numbers; metering is planned. Server-mode `simulateTransaction` does return real `cost.cpuInsns` separately.)
+- **Server `simulateTransaction` fee fields are stubbed.** `minResourceFee` is `"0"` and `cost.memBytes` reports `write_bytes` as a proxy. Real fee calculation against the live Stellar fee schedule and proper memory accounting are a v0.5.x followup.
 - **Footprint discovery.** Soroban requires declaring the transaction footprint before execution. The fork tool handles this transparently via the recording-mode footprint in the test environment.
 
 ## Requirements

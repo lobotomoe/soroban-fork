@@ -48,6 +48,12 @@ mod rpc;
 mod source;
 pub mod trace;
 
+/// JSON-RPC server mode. Available with the `server` cargo feature —
+/// pulls in tokio + axum + tower-http; library-mode users (default)
+/// don't pay for these deps.
+#[cfg(feature = "server")]
+pub mod server;
+
 pub use error::{ForkError, Result};
 pub use rpc::{FetchedEntry, LatestLedger, NetworkMetadata, RpcClient, RpcConfig};
 pub use source::{FetchMode, RpcSnapshotSource};
@@ -82,6 +88,12 @@ pub struct ForkedEnv {
     timestamp: u64,
     network_id: [u8; 32],
     protocol_version: u32,
+    /// Network passphrase from the fork-time `getNetwork` call. Kept so
+    /// the optional JSON-RPC server can answer `getNetwork` without a
+    /// re-query and so future reproducibility tools can verify a cache
+    /// matches its declared network. `None` only when the user
+    /// overrode `network_id` and we never had a passphrase to keep.
+    passphrase: Option<String>,
 }
 
 impl std::ops::Deref for ForkedEnv {
@@ -188,6 +200,47 @@ impl ForkedEnv {
             args.push_back(abs_delta);
             e.invoke_contract::<()>(token, &Symbol::new(e, "burn"), args);
         }
+    }
+
+    /// Network passphrase from the fork-time `getNetwork` call, or `None`
+    /// if the user overrode `network_id` (in which case we never queried
+    /// the upstream RPC and don't know the passphrase). Used by the
+    /// optional JSON-RPC server's `getNetwork` method.
+    pub fn passphrase(&self) -> Option<&str> {
+        self.passphrase.as_deref()
+    }
+
+    /// SHA-256 hash of the network passphrase. Returned by
+    /// `getNetwork` as `networkId` after hex encoding.
+    pub fn network_id(&self) -> [u8; 32] {
+        self.network_id
+    }
+
+    /// Protocol version reported by the forked Env.
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    /// Ledger sequence reported by the forked Env. Equal to the upstream
+    /// RPC's latest at fork-build time, or whatever was passed to
+    /// [`ForkConfig::at_ledger`].
+    pub fn ledger_sequence(&self) -> u32 {
+        self.ledger_sequence
+    }
+
+    /// Close-time the forked Env reports (Unix seconds). Equal to the
+    /// upstream RPC's `getLedgers` close time at fork-build time, or
+    /// whatever was passed to [`ForkConfig::pinned_timestamp`].
+    pub fn ledger_close_time(&self) -> u64 {
+        self.timestamp
+    }
+
+    /// Direct access to the snapshot source. Useful when the JSON-RPC
+    /// server needs to resolve `getLedgerEntries` requests through the
+    /// same cache the SDK reads from — exposing it here avoids
+    /// duplicating the lazy-fetch logic in the server module.
+    pub fn snapshot_source(&self) -> &Rc<RpcSnapshotSource> {
+        &self.source
     }
 
     /// Reconstruct the cross-contract call tree from the host's diagnostic
@@ -465,10 +518,18 @@ impl ForkConfig {
 
         let latest = client.get_latest_ledger()?;
 
-        // Resolve network_id: explicit override wins; otherwise fetch from RPC.
-        let network_id = match self.network_id {
-            Some(id) => id,
-            None => client.get_network()?.network_id,
+        // Resolve network metadata: explicit override wins; otherwise
+        // fetch from the upstream RPC. We keep the passphrase around
+        // (for the optional JSON-RPC server's `getNetwork`) when we
+        // queried it ourselves; an explicit `network_id` override
+        // intentionally has `None` passphrase since we don't know what
+        // the caller used.
+        let (network_id, passphrase) = match self.network_id {
+            Some(id) => (id, None),
+            None => {
+                let meta = client.get_network()?;
+                (meta.network_id, Some(meta.passphrase))
+            }
         };
 
         let sequence = self.pinned_ledger.unwrap_or(latest.sequence);
@@ -531,6 +592,7 @@ impl ForkConfig {
             cache_path: self.cache_path,
             ledger_sequence: sequence,
             timestamp,
+            passphrase,
             network_id,
             protocol_version,
         })
