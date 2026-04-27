@@ -263,7 +263,18 @@ Soroswap, etc.) follow the same pattern: dependencies the deployed
 contract reaches into get lazy-fetched from mainnet and cached
 locally.
 
-### Methods supported in v0.8.4
+### The headline showcase: cheatcode-only deploy
+
+What makes the toolset matter, in one test:
+
+1. **`fork_setCode`** installs your WASM bytes (no `UploadContractWasm` envelope)
+2. **`fork_setStorage`** installs the contract instance entry pointing at that WASM, at a synthetic contract address (no `CreateContract` envelope, no source-account juggling, no salt)
+3. **`simulateTransaction`** invokes your cheatcode-deployed contract, returns the result
+4. The same fork still serves live mainnet contracts — `XLM SAC.decimals()` returns `7`, your `synth_contract.add(2,3)` returns `5`, both in the same simulation context
+
+Two cheatcode calls and a contract is callable. That's the Foundry-`vm.etch`-equivalent — the headline reason this toolset exists. Live in [`server_cheatcode_only_deploy_coexists_with_mainnet`](tests/server_smoke.rs); end-to-end against mainnet, ~70 LoC.
+
+### Methods supported in v0.8.5
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -354,7 +365,7 @@ client can distinguish "this works against any Stellar RPC" from
   staleness) past thresholds without orchestrating real
   transactions.
 
-### What v0.8.4 server does NOT support
+### What v0.8.5 server does NOT support
 
 Listed up front so nothing surprises you:
 

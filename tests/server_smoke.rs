@@ -1628,6 +1628,210 @@ async fn read_trustline_balance(
     }
 }
 
+/// **Headline showcase test** — proves the v0.8 cheatcode surface
+/// works as a coherent product, not just isolated features.
+///
+/// Demonstrates the **cheatcode-only deploy pipeline**: install a
+/// custom contract using nothing but `fork_setCode` +
+/// `fork_setStorage`, no `UploadContractWasm` / `CreateContract`
+/// envelope ceremony. Then proves that the cheatcode-installed
+/// contract and the live mainnet state coexist in the same fork —
+/// `simulateTransaction` resolves both successfully back-to-back.
+///
+/// This is the headline integration test: every relevant capability
+/// from v0.8.0–v0.8.4 lights up:
+/// - `fork_setCode` (v0.8.3) — install the WASM
+/// - `fork_setStorage` (v0.8.2) — install the contract instance
+///   entry pointing at that WASM, at a synthetic contract address
+/// - `simulateTransaction` (v0.5+) — invoke the cheatcode-installed
+///   contract; same call also exercises a live mainnet contract to
+///   prove they coexist
+///
+/// **Why this is the Anvil-power moment**: in Foundry, `vm.etch`
+/// installs bytecode at any address with one call, and `vm.prank` /
+/// `vm.deal` set up state without deploying real transactions. The
+/// equivalent for Soroban is "install a contract via two cheatcode
+/// calls, no envelope dance" — which this test executes literally.
+///
+/// Synthetic contract address: `Hash([0xCC; 32])`. Encoded as a
+/// "C..." strkey it's deterministic; chosen to avoid collision with
+/// any plausible mainnet address.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live Stellar mainnet RPC (opt-in via `cargo test -- --ignored`)"]
+async fn server_cheatcode_only_deploy_coexists_with_mainnet() {
+    use sha2::{Digest, Sha256};
+    use soroban_env_host::xdr::{ContractExecutable, ScContractInstance, ScVal as ScValTy, VecM};
+
+    /// Same precompiled fixture the other tests use. Exports
+    /// `add(i32, i32) -> i32`.
+    const ADD_I32_WASM: &[u8] = include_bytes!("fixtures/add_i32.wasm");
+    /// Synthetic 32-byte contract id. `0xCC` ("Cheatcode-Created")
+    /// gives a memorable, deterministic, no-collision-with-mainnet
+    /// address. Encoded as a "C..." strkey it's stable across runs.
+    const SYNTH_CONTRACT_ID: [u8; 32] = [0xCC; 32];
+
+    let (url, running) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // ---- Step 1: install WASM via fork_setCode ----
+    // No UploadContractWasm envelope, no source-account juggling —
+    // just hand the bytes to the cheatcode and get the hash back.
+    let wasm_b64 = BASE64.encode(ADD_I32_WASM);
+    let expected_code_hash: [u8; 32] = Sha256::digest(ADD_I32_WASM).into();
+    let set_code_resp = jsonrpc_call(
+        &client,
+        &url,
+        "fork_setCode",
+        serde_json::json!({
+            "wasm": wasm_b64,
+            // Effectively-forever TTL. Real Stellar archives entries
+            // past their live_until; the host's storage check sees
+            // "no live_until set" as "archived" and refuses to read.
+            "liveUntilLedgerSeq": 999_999_999u32,
+        }),
+    )
+    .await;
+    assert_eq!(set_code_resp["result"]["ok"], true);
+    let returned_hash_hex = set_code_resp["result"]["hash"].as_str().unwrap();
+    let expected_hash_hex: String = expected_code_hash
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        returned_hash_hex, expected_hash_hex,
+        "fork_setCode must return the sha256(wasm) hash the client computes"
+    );
+
+    // ---- Step 2: install ContractInstance entry via fork_setStorage ----
+    // The instance entry's `val` field is a `ScVal::ContractInstance`
+    // pointing at the WASM hash we just installed. `key` is the
+    // marker `ScVal::LedgerKeyContractInstance`, durability persistent.
+    // After this write, the contract at SYNTH_CONTRACT_ID is callable.
+    // `Contract::to_string()` returns heapless::String<56>; format! coerces
+    // to std::String so serde_json can serialise it.
+    let contract_strkey = format!("{}", stellar_strkey::Contract(SYNTH_CONTRACT_ID));
+    let instance_key = ScVal::LedgerKeyContractInstance;
+    let instance_value = ScValTy::ContractInstance(ScContractInstance {
+        executable: ContractExecutable::Wasm(Hash(expected_code_hash)),
+        storage: None, // add_i32 uses no instance storage
+    });
+    let key_b64 = BASE64.encode(instance_key.to_xdr(Limits::none()).unwrap());
+    let value_b64 = BASE64.encode(instance_value.to_xdr(Limits::none()).unwrap());
+    let set_storage_resp = jsonrpc_call(
+        &client,
+        &url,
+        "fork_setStorage",
+        serde_json::json!({
+            "contract": contract_strkey,
+            "key": key_b64,
+            "value": value_b64,
+            // durability defaults to "persistent" — instance entries
+            // are persistent on real Stellar
+            "liveUntilLedgerSeq": 999_999_999u32,
+        }),
+    )
+    .await;
+    assert_eq!(set_storage_resp["result"]["ok"], true);
+
+    // ---- Step 3: invoke OUR contract; assert the response ----
+    let our_call_resp = simulate_invoke(
+        &client,
+        &url,
+        SYNTH_CONTRACT_ID,
+        "add",
+        vec![ScVal::I32(2), ScVal::I32(3)],
+    )
+    .await;
+    assert!(
+        our_call_resp["result"]["error"].is_null(),
+        "cheatcode-deployed contract.add(2,3) must simulate without error: {our_call_resp:#}"
+    );
+    let our_xdr = our_call_resp["result"]["results"][0]["xdr"]
+        .as_str()
+        .expect("our contract returned a result xdr");
+    let our_scval = ScVal::from_xdr(BASE64.decode(our_xdr).unwrap(), Limits::none())
+        .expect("decode our contract's ScVal");
+    assert_eq!(
+        our_scval,
+        ScVal::I32(5),
+        "cheatcode-deployed add(2,3) must return I32(5)"
+    );
+
+    // ---- Step 4: invoke a MAINNET contract in the same fork ----
+    // Proves cheatcode-installed contracts coexist with live state —
+    // installing OUR code at SYNTH_CONTRACT_ID didn't break the
+    // ability to read XLM SAC, Phoenix, Soroswap, anything else.
+    let mainnet_id = decode_contract_id(XLM_SAC);
+    let mainnet_resp = simulate_invoke(&client, &url, mainnet_id, "decimals", vec![]).await;
+    assert!(
+        mainnet_resp["result"]["error"].is_null(),
+        "mainnet XLM SAC.decimals() must still simulate cleanly after cheatcode deploy: {mainnet_resp:#}"
+    );
+    let mainnet_xdr = mainnet_resp["result"]["results"][0]["xdr"]
+        .as_str()
+        .expect("mainnet contract returned a result xdr");
+    let mainnet_scval = ScVal::from_xdr(BASE64.decode(mainnet_xdr).unwrap(), Limits::none())
+        .expect("decode mainnet ScVal");
+    assert_eq!(
+        mainnet_scval,
+        ScVal::U32(7),
+        "XLM.decimals() should still return 7 from live mainnet state"
+    );
+
+    // Sanity: VecM<ScVal> usage above is compile-only — the XDR
+    // round-trip already happened in simulate_invoke.
+    let _: VecM<ScVal, { u32::MAX }> = VecM::default();
+
+    running.shutdown().await.expect("shutdown");
+}
+
+/// Helper for the showcase test: build a minimal
+/// `InvokeHostFunctionOp` envelope that calls
+/// `contract.fn_name(args...)` and POST it to `simulateTransaction`.
+/// Returns the parsed response value. All-zeros source account; no
+/// fee; sequence 0 — recording mode doesn't enforce any of these.
+async fn simulate_invoke(
+    client: &reqwest::Client,
+    url: &str,
+    contract_id: [u8; 32],
+    fn_name: &str,
+    args: Vec<ScVal>,
+) -> Value {
+    let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: ScAddress::Contract(ContractId(Hash(contract_id))),
+        function_name: ScSymbol(fn_name.try_into().unwrap()),
+        args: args.try_into().unwrap(),
+    });
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: host_fn,
+            auth: vec![].try_into().unwrap(),
+        }),
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+        fee: 0,
+        seq_num: SequenceNumber(0),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: vec![].try_into().unwrap(),
+    });
+    let envelope_b64 = BASE64.encode(envelope.to_xdr(Limits::none()).expect("encode envelope"));
+    jsonrpc_call(
+        client,
+        url,
+        "simulateTransaction",
+        serde_json::json!({ "transaction": envelope_b64 }),
+    )
+    .await
+}
+
 // `dummy_source_account` is referenced from a docstring example only;
 // silence the unused-but-needed-as-sample warning.
 #[allow(dead_code)]
