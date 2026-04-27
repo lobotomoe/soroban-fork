@@ -40,11 +40,7 @@ pub fn fetch_fee_configuration(source: &RpcSnapshotSource) -> Result<FeeConfigur
     apply_setting(source, ConfigSettingId::ContractComputeV0, &mut cfg)?;
     apply_setting(source, ConfigSettingId::ContractLedgerCostV0, &mut cfg)?;
     apply_setting(source, ConfigSettingId::ContractLedgerCostExtV0, &mut cfg)?;
-    apply_setting(
-        source,
-        ConfigSettingId::ContractHistoricalDataV0,
-        &mut cfg,
-    )?;
+    apply_setting(source, ConfigSettingId::ContractHistoricalDataV0, &mut cfg)?;
     apply_setting(source, ConfigSettingId::ContractEventsV0, &mut cfg)?;
     apply_setting(source, ConfigSettingId::ContractBandwidthV0, &mut cfg)?;
 

@@ -548,9 +548,7 @@ fn send_transaction(
 
     let (result, applied_changes) = match invoke_result {
         Ok(rec) => {
-            let result = rec
-                .invoke_result
-                .map_err(|e| format!("host error: {e}"));
+            let result = rec.invoke_result.map_err(|e| format!("host error: {e}"));
             // Only apply changes when the host invocation actually
             // succeeded — a failed invocation produces no semantic
             // writes (the host doesn't expose partial mutations).
@@ -680,7 +678,9 @@ fn compute_min_resource_fee(
                 events_size = events_size.saturating_add(bytes.len() as u32);
             }
             Err(e) => {
-                warn!("soroban-fork: minResourceFee skipped — contract event XDR encode failed: {e}");
+                warn!(
+                    "soroban-fork: minResourceFee skipped — contract event XDR encode failed: {e}"
+                );
                 return None;
             }
         }

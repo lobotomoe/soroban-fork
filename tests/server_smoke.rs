@@ -509,8 +509,9 @@ async fn server_pre_funded_account_seq_increments() {
     // against an entry the fork pre-populated.
     let accounts = test_accounts::generate(1);
     let account_0 = &accounts[0];
-    let account_id =
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_0.public_key)));
+    let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        account_0.public_key,
+    )));
     let account_key = LedgerKey::Account(soroban_env_host::xdr::LedgerKeyAccount {
         account_id: account_id.clone(),
     });
@@ -887,8 +888,9 @@ async fn server_test_account_swaps_xlm_for_usdc_on_phoenix() {
     let client = reqwest::Client::new();
 
     let account_0 = &test_accounts::generate(1)[0];
-    let alice_account_id =
-        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_0.public_key)));
+    let alice_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        account_0.public_key,
+    )));
     let alice_address = ScAddress::Account(alice_account_id.clone());
     let xlm_sac_id = decode_contract_id(XLM_SAC);
     let _ = USDC_SAC_STR; // referenced in the docstring scenario only
@@ -910,8 +912,7 @@ async fn server_test_account_swaps_xlm_for_usdc_on_phoenix() {
         account_id: alice_account_id.clone(),
         asset: usdc_asset,
     });
-    let usdc_trustline_key_b64 =
-        BASE64.encode(usdc_trustline_key.to_xdr(Limits::none()).unwrap());
+    let usdc_trustline_key_b64 = BASE64.encode(usdc_trustline_key.to_xdr(Limits::none()).unwrap());
 
     // 1. Pre-condition: alice's USDC trustline exists at zero balance.
     let pre = jsonrpc_call(

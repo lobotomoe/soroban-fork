@@ -30,8 +30,7 @@ use soroban_env_host::xdr::{
 /// without manually pre-creating the trustline.
 ///
 /// Source: <https://stellar.expert/explorer/public/asset/USDC-GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN-1>
-pub const USDC_MAINNET_ISSUER: &str =
-    "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+pub const USDC_MAINNET_ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 
 /// One pre-funded test account.
 ///
@@ -83,8 +82,7 @@ impl TestAccount {
     /// next tx must use `seq + 1`), zero subentries, default
     /// thresholds (1/0/0/0), no signers, no inflation destination.
     pub(crate) fn ledger_entry(&self, fork_ledger_seq: u32) -> (LedgerKey, LedgerEntry) {
-        let account_id =
-            AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(self.public_key)));
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(self.public_key)));
 
         // Stellar's convention for a freshly-mined account is
         // `seq_num = ledger_seq << 32`; the very next tx the
@@ -136,8 +134,7 @@ impl TestAccount {
         asset: TrustLineAsset,
         fork_ledger_seq: u32,
     ) -> (LedgerKey, LedgerEntry) {
-        let account_id =
-            AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(self.public_key)));
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(self.public_key)));
 
         let entry = TrustLineEntry {
             account_id: account_id.clone(),
