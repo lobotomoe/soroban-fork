@@ -50,12 +50,6 @@ pub enum ForkError {
         /// doesn't confuse it with the error-chain source attribute.
         message: String,
     },
-
-    /// The caller asked for a feature that requires an already-fetched
-    /// value but the fetch hasn't happened yet. Not currently emitted —
-    /// reserved for future sanity checks.
-    #[error("inconsistent fork state: {0}")]
-    Inconsistent(&'static str),
 }
 
 impl From<reqwest::Error> for ForkError {

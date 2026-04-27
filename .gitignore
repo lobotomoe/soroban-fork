@@ -11,3 +11,5 @@ test_snapshots/test_*.json
 .idea/
 .vscode/
 .DS_Store
+
+.claude/

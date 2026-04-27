@@ -54,7 +54,6 @@ pub use source::{FetchMode, RpcSnapshotSource};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
 use soroban_sdk::testutils::{Ledger as _, SnapshotSourceInput};
@@ -299,9 +298,16 @@ impl ForkConfig {
 
     /// Pin the ledger timestamp the forked `Env` reports (Unix seconds).
     ///
-    /// The default is `SystemTime::now()` — a wall-clock approximation of
-    /// the real ledger close time (~5 s off at most). Pin an explicit value
-    /// for tests that assert on specific close times.
+    /// The default is the close time of the ledger we're forking from,
+    /// fetched via `getLedgers` at build time. That keeps tests
+    /// deterministic across runs — the previous wall-clock default made
+    /// every run depend on when it was started, which is a footgun
+    /// silently waiting to bite anyone who asserts on contract logic that
+    /// reads `env.ledger().timestamp()`.
+    ///
+    /// Pin an explicit value when reproducing a known historical
+    /// scenario or when the network's reported close time would conflict
+    /// with the test's assumed timeline.
     pub fn pinned_timestamp(mut self, unix_seconds: u64) -> Self {
         self.pinned_timestamp = Some(unix_seconds);
         self
@@ -385,9 +391,7 @@ impl ForkConfig {
             }
             _ => latest.protocol_version,
         };
-        let timestamp = self
-            .pinned_timestamp
-            .unwrap_or_else(|| wall_clock_seconds().unwrap_or(0));
+        let timestamp = self.pinned_timestamp.unwrap_or(latest.close_time);
 
         let sdk_ledger_info = soroban_env_host::LedgerInfo {
             protocol_version,
@@ -449,16 +453,6 @@ fn do_save_cache(
     )
 }
 
-/// Returns the current Unix timestamp in seconds, or `None` if the system
-/// clock is set before the epoch (basically never on any real machine, but
-/// handled explicitly so the call site can't panic).
-fn wall_clock_seconds() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .ok()
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -496,13 +490,6 @@ mod tests {
         let cfg = ForkConfig::new("https://example.test");
         let s = format!("{cfg:?}");
         assert!(s.contains("example.test"));
-    }
-
-    #[test]
-    fn wall_clock_seconds_returns_some_on_reasonable_system() {
-        let now = wall_clock_seconds().expect("system clock should be post-1970");
-        // Assert roughly "some time after Stellar mainnet launch (2015)".
-        assert!(now > 1_440_000_000);
     }
 
     /// The `getNetwork`-based network_id path is exercised in

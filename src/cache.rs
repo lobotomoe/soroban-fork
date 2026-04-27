@@ -6,6 +6,7 @@
 //! `stellar` tooling.
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use soroban_env_host::xdr::{LedgerEntry, LedgerKey};
 use soroban_ledger_snapshot::LedgerSnapshot;
@@ -39,6 +40,11 @@ pub fn load_snapshot(path: &Path) -> Result<Vec<(LedgerKey, LedgerEntry, Option<
 
 /// Persist ledger entries to a snapshot JSON file. Overwrites any existing
 /// file at `path`.
+///
+/// The write is atomic on POSIX: contents go to a sibling temp file first
+/// and are renamed into place. A crash mid-write therefore leaves either
+/// the previous cache intact or no change at all — never a half-written
+/// JSON file that the next test would refuse to parse.
 pub fn save_snapshot(
     path: &Path,
     entries: &[(LedgerKey, LedgerEntry, Option<u32>)],
@@ -69,10 +75,43 @@ pub fn save_snapshot(
         ledger_entries,
     };
 
-    snapshot.write_file(path).map_err(|e| ForkError::Cache {
-        path: path.to_path_buf(),
+    let tmp = tmp_sibling(path);
+    snapshot.write_file(&tmp).map_err(|e| ForkError::Cache {
+        path: tmp.clone(),
         message: e.to_string(),
+    })?;
+
+    std::fs::rename(&tmp, path).map_err(|e| {
+        // Best-effort cleanup: if rename failed, the tmp file is dead weight.
+        let _ = std::fs::remove_file(&tmp);
+        ForkError::Cache {
+            path: path.to_path_buf(),
+            message: format!("rename {} -> {}: {e}", tmp.display(), path.display()),
+        }
     })
+}
+
+/// Build a sibling path for the temp file used during atomic writes.
+///
+/// The name is unique per `(pid, nanos)` so concurrent writers — e.g. two
+/// test binaries sharing a cache file — don't stomp on each other's tmp
+/// file before either rename completes.
+fn tmp_sibling(path: &Path) -> std::path::PathBuf {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("snapshot");
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!(".{filename}.tmp.{pid}.{nanos}");
+    match parent {
+        Some(p) => p.join(tmp_name),
+        None => std::path::PathBuf::from(tmp_name),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,5 +184,50 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("soroban-fork-test-{}-{name}", std::process::id()));
         p
+    }
+
+    #[test]
+    fn tmp_sibling_lives_next_to_target() {
+        let target = std::path::PathBuf::from("/tmp/cache.json");
+        let tmp = tmp_sibling(&target);
+        assert_eq!(tmp.parent(), Some(std::path::Path::new("/tmp")));
+        let name = tmp.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(name.starts_with(".cache.json.tmp."));
+    }
+
+    #[test]
+    fn tmp_sibling_handles_bare_filename() {
+        // No parent component — must still produce a usable tmp name in the cwd.
+        let target = std::path::PathBuf::from("cache.json");
+        let tmp = tmp_sibling(&target);
+        let name = tmp.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(name.starts_with(".cache.json.tmp."));
+    }
+
+    #[test]
+    fn save_is_atomic_no_tmp_left_behind() {
+        let target = tempfile_path("atomic.json");
+        save_snapshot(&target, &[dummy_entry()], 1, 1, [0; 32], 25).expect("save");
+
+        // After a successful save, the tmp file must not exist.
+        let parent = target.parent().unwrap();
+        let leftover_tmps: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| {
+                        n.starts_with(&format!(
+                            ".{}.tmp.",
+                            target.file_name().unwrap().to_str().unwrap()
+                        ))
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(leftover_tmps.is_empty(), "tmp leftovers: {leftover_tmps:?}");
+
+        std::fs::remove_file(&target).ok();
     }
 }

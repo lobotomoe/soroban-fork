@@ -5,7 +5,8 @@
 //! Configurable retry + HTTP timeouts live here; XDR encode/decode sits here
 //! too so the rest of the crate never touches wire formats directly.
 
-use std::time::Duration;
+use std::cell::Cell;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use log::{debug, warn};
@@ -17,6 +18,11 @@ use soroban_env_host::xdr::{
 };
 
 use crate::error::{ForkError, Result};
+
+/// Maximum number of bytes of an HTTP response body to embed in a
+/// transport error. Soroban RPC error pages from edge caches (Cloudflare,
+/// gateway.fm) can be large; truncating keeps logs readable.
+const ERROR_BODY_TRUNCATE_BYTES: usize = 256;
 
 /// Tuning for the RPC transport layer.
 #[derive(Clone, Debug)]
@@ -52,12 +58,20 @@ pub struct FetchedEntry {
     pub live_until: Option<u32>,
 }
 
-/// Lightweight summary of the `getLatestLedger` RPC response.
+/// Snapshot of the latest closed ledger as reported by the RPC.
+///
+/// `close_time` is fetched separately via `getLedgers` because
+/// `getLatestLedger` does not include it in its response — the extra
+/// round-trip happens once at fork build time.
 pub struct LatestLedger {
     /// Latest closed ledger sequence.
     pub sequence: u32,
     /// Current protocol version the network is running.
     pub protocol_version: u32,
+    /// Unix-seconds close time of the latest ledger. Defaulting the
+    /// forked `Env`'s timestamp to this value keeps tests reproducible —
+    /// wall-clock defaults make every run depend on when it was started.
+    pub close_time: u64,
 }
 
 /// Network metadata from the `getNetwork` RPC response.
@@ -91,14 +105,45 @@ impl RpcClient {
         })
     }
 
-    /// Retrieve the latest ledger sequence + protocol version.
+    /// Retrieve the latest ledger sequence, protocol version, and close time.
+    ///
+    /// Issues two RPC calls: `getLatestLedger` (sequence + protocol) and
+    /// `getLedgers` for that sequence (close time). Both succeed or the
+    /// whole call fails — partial state would let the build proceed with
+    /// a wall-clock timestamp, which is exactly the silent fallback this
+    /// API is designed to avoid.
     pub fn get_latest_ledger(&self) -> Result<LatestLedger> {
         let response: JsonRpcResponse<GetLatestLedgerResult> =
             self.rpc_post("getLatestLedger", serde_json::json!({}))?;
         let result = response.into_result()?;
+        let close_time = self.get_ledger_close_time(result.sequence)?;
         Ok(LatestLedger {
             sequence: result.sequence,
             protocol_version: result.protocol_version,
+            close_time,
+        })
+    }
+
+    /// Fetch the close time (Unix seconds) of a specific ledger via
+    /// `getLedgers`. Returns an error if the ledger is outside the RPC's
+    /// retention window.
+    pub fn get_ledger_close_time(&self, sequence: u32) -> Result<u64> {
+        let response: JsonRpcResponse<GetLedgersResult> = self.rpc_post(
+            "getLedgers",
+            serde_json::json!({
+                "startLedger": sequence,
+                "pagination": { "limit": 1 },
+            }),
+        )?;
+        let result = response.into_result()?;
+        let ledger = result.ledgers.into_iter().next().ok_or_else(|| {
+            ForkError::RpcError(format!("getLedgers returned no entry for {sequence}"))
+        })?;
+        ledger.ledger_close_time.parse::<u64>().map_err(|e| {
+            ForkError::RpcError(format!(
+                "getLedgers returned non-numeric ledgerCloseTime '{}': {e}",
+                ledger.ledger_close_time
+            ))
         })
     }
 
@@ -194,14 +239,21 @@ impl RpcClient {
             .map_err(|e| RetryDecision::Retry(ForkError::from(e)))?;
 
         let status = response.status();
-        if status.as_u16() == 429 || status.is_server_error() {
+        let code = status.as_u16();
+        // 408 Request Timeout, 425 Too Early, 429 Too Many Requests + 5xx
+        // are the canonical "try again" set. Everything else 4xx is a
+        // permanent caller error (bad auth, bad URL, bad JSON-RPC method).
+        let retryable = matches!(code, 408 | 425 | 429) || status.is_server_error();
+        if retryable {
+            let body = response_body_snippet(response);
             return Err(RetryDecision::Retry(ForkError::Transport(format!(
-                "HTTP {status}"
+                "HTTP {status}: {body}"
             ))));
         }
         if !status.is_success() {
+            let body = response_body_snippet(response);
             return Err(RetryDecision::Fatal(ForkError::Transport(format!(
-                "HTTP {status}"
+                "HTTP {status}: {body}"
             ))));
         }
 
@@ -211,6 +263,33 @@ impl RpcClient {
     }
 }
 
+/// Best-effort extraction of a short, printable body snippet for error
+/// messages. Returns `<no body>` if the body can't be read.
+fn response_body_snippet(response: reqwest::blocking::Response) -> String {
+    match response.text() {
+        Ok(body) => {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                "<empty body>".to_string()
+            } else {
+                truncate_chars(trimmed, ERROR_BODY_TRUNCATE_BYTES)
+            }
+        }
+        Err(_) => "<no body>".to_string(),
+    }
+}
+
+/// Truncate at character (not byte) boundary so we never split a
+/// multi-byte UTF-8 sequence in the middle. Appends `…` if truncated.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
 enum RetryDecision {
     /// Transient failure — caller should back off and retry if budget remains.
     Retry(ForkError),
@@ -218,12 +297,55 @@ enum RetryDecision {
     Fatal(ForkError),
 }
 
-/// Exponential backoff: `base * 2^attempt`. Kept as a free function so it's
-/// unit-testable without standing up an `RpcClient`.
+/// Exponential backoff with full jitter: each delay is uniformly sampled
+/// from `[base * 2^attempt, base * 2^attempt + base)`. The jitter prevents
+/// a fleet of concurrent tests from synchronising their retries into a
+/// thundering-herd pattern when the RPC is briefly degraded.
+///
+/// Kept as a free function so it's unit-testable without standing up an
+/// `RpcClient`.
 fn backoff_delay(base: Duration, attempt: u32) -> Duration {
     // Saturating pow prevents overflow on absurd retry counts.
     let factor = 2u32.saturating_pow(attempt);
-    base.saturating_mul(factor)
+    let exponential = base.saturating_mul(factor);
+    let jitter = jitter_under(base);
+    exponential.saturating_add(jitter)
+}
+
+/// Random `Duration` in `[0, max)`. Returns `Duration::ZERO` if `max` is
+/// zero. Uses a thread-local xorshift64* seeded from the system clock —
+/// good enough for spreading retries, not cryptographically random.
+fn jitter_under(max: Duration) -> Duration {
+    let max_nanos = max.as_nanos() as u64;
+    if max_nanos == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_nanos(next_rng_u64() % max_nanos)
+}
+
+thread_local! {
+    static RNG_STATE: Cell<u64> = Cell::new(seed_rng());
+}
+
+fn seed_rng() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_nanos() as u64).wrapping_mul(0x9E3779B97F4A7C15))
+        .unwrap_or(0xDEAD_BEEF_CAFE_BABE)
+        | 1 // ensure non-zero — xorshift would degenerate on 0
+}
+
+fn next_rng_u64() -> u64 {
+    RNG_STATE.with(|cell| {
+        let mut x = cell.get();
+        // xorshift64 — Marsaglia 2003. State is never zero (seeded with |1
+        // and the transform preserves non-zero), so degeneracy isn't a risk.
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        cell.set(x);
+        x
+    })
 }
 
 fn encode_key(key: &LedgerKey) -> Result<String> {
@@ -321,6 +443,24 @@ struct GetNetworkResult {
     protocol_version: Option<u32>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetLedgersResult {
+    ledgers: Vec<LedgerInfoWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LedgerInfoWire {
+    #[allow(dead_code)]
+    sequence: u32,
+    /// `getLedgers` returns this as a string-encoded Unix-seconds value
+    /// (per the Stellar RPC OpenRPC spec). We parse to `u64` at the
+    /// `RpcClient::get_ledger_close_time` boundary so callers get a
+    /// numeric type and obvious failure on protocol drift.
+    ledger_close_time: String,
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests — no network required.
 // ---------------------------------------------------------------------------
@@ -330,12 +470,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backoff_delay_doubles_each_attempt() {
+    fn backoff_delay_doubles_each_attempt_within_jitter_window() {
+        // With full jitter, the delay falls in [base * 2^attempt, base * (2^attempt + 1)).
+        // Sample many times to smoke out off-by-one boundary mistakes in the
+        // jitter implementation.
         let base = Duration::from_millis(100);
-        assert_eq!(backoff_delay(base, 0), Duration::from_millis(100));
-        assert_eq!(backoff_delay(base, 1), Duration::from_millis(200));
-        assert_eq!(backoff_delay(base, 2), Duration::from_millis(400));
-        assert_eq!(backoff_delay(base, 3), Duration::from_millis(800));
+        for attempt in 0u32..4 {
+            let factor = 2u32.pow(attempt);
+            let lower = base * factor;
+            let upper = base * (factor + 1);
+            for _ in 0..32 {
+                let d = backoff_delay(base, attempt);
+                assert!(
+                    d >= lower && d < upper,
+                    "attempt {attempt}: {d:?} not in [{lower:?}, {upper:?})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -345,6 +496,30 @@ mod tests {
         let d = backoff_delay(base, 100);
         // Any finite result is acceptable; the important property is "doesn't panic".
         assert!(d >= base);
+    }
+
+    #[test]
+    fn backoff_delay_zero_base_is_zero() {
+        // Edge case: zero base => zero delay, no panic from `% 0`.
+        assert_eq!(backoff_delay(Duration::ZERO, 0), Duration::ZERO);
+        assert_eq!(backoff_delay(Duration::ZERO, 5), Duration::ZERO);
+    }
+
+    #[test]
+    fn truncate_chars_handles_multibyte_safely() {
+        // Cyrillic + emoji: each char is 2-4 bytes. Naive byte slicing
+        // would panic on a UTF-8 boundary.
+        let s = "тест🚀тест";
+        let out = truncate_chars(s, 5);
+        // 5 chars + ellipsis (more than 5 chars in the source).
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 6);
+    }
+
+    #[test]
+    fn truncate_chars_short_input_unchanged() {
+        assert_eq!(truncate_chars("abc", 10), "abc");
+        assert_eq!(truncate_chars("", 10), "");
     }
 
     #[test]

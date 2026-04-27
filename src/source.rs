@@ -38,6 +38,14 @@ pub enum FetchMode {
 /// - `Some(None)` → we've asked, RPC said the entry doesn't exist. Negative
 ///   cache — stops us re-asking for keys we know are absent.
 /// - `None` → we haven't asked yet.
+///
+/// Thread-safety: this type is **not** `Send`/`Sync`. The cache stores
+/// `EntryWithLiveUntil = (Rc<LedgerEntry>, Option<u32>)` to match the
+/// signature of [`SnapshotSource::get`], and `Rc` is intentionally
+/// single-threaded. Sharing across threads will require switching the
+/// internal representation to XDR bytes (parsed lazily on get) or to
+/// `Arc<LedgerEntry>` plus a boundary clone — that change lands together
+/// with the planned RPC-server mode.
 pub struct RpcSnapshotSource {
     cache: RefCell<BTreeMap<LedgerKey, Option<EntryWithLiveUntil>>>,
     client: Arc<RpcClient>,

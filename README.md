@@ -12,7 +12,7 @@ When a test reads a ledger entry that isn't in the local cache, `soroban-fork` f
 
 ```toml
 [dev-dependencies]
-soroban-fork = "0.1"
+soroban-fork = "0.2"
 ```
 
 ## Usage
@@ -101,6 +101,12 @@ Network metadata (passphrase + SHA-256 id) is fetched from the RPC's
 `getNetwork` method at build time — no URL heuristics, no silent defaults.
 Override with `.network_id(bytes)` only if you actually need to.
 
+The `Env`'s reported timestamp defaults to the close time of the latest
+ledger, fetched via `getLedgers` at build time. Tests are reproducible
+across runs out of the box — pin an explicit value via
+`.pinned_timestamp(...)` only when you need to anchor to a specific
+moment (e.g. reproducing a known historical scenario).
+
 ### `ForkedEnv`
 
 Returned by `ForkConfig::build()`. Implements `Deref<Target = Env>` so all SDK
@@ -131,9 +137,12 @@ Controls behavior when the RPC fails from inside the VM loop (where the
 
 ### `RpcConfig`
 
-Transport tunables. Defaults: 3 retries with 300 ms exponential backoff,
-30 s per-request timeout, 200-key batch size (Soroban RPC cap). Customize
-via `.rpc_config(RpcConfig { .. })` on the builder.
+Transport tunables. Defaults: 3 retries with 300 ms exponential backoff
+plus full jitter (so concurrent test runners don't synchronise their
+retries into a thundering herd), 30 s per-request timeout, 200-key batch
+size (Soroban RPC cap). Customize via `.rpc_config(RpcConfig { .. })` on
+the builder. HTTP 408, 425, 429, and 5xx responses are retried; other
+4xx codes fail fast and include the response body for diagnostics.
 
 ### `RpcSnapshotSource`
 
