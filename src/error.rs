@@ -50,6 +50,15 @@ pub enum ForkError {
         /// doesn't confuse it with the error-chain source attribute.
         message: String,
     },
+
+    /// An out-of-band operation on the underlying soroban-env-host failed.
+    ///
+    /// Currently only emitted by [`super::ForkConfig::tracing`] when
+    /// switching the host's diagnostic level. Per-call contract failures
+    /// surface as panics from `Env::invoke_contract` and never travel
+    /// through this enum — that's an SDK boundary we don't reach across.
+    #[error("host operation failed: {0}")]
+    Host(String),
 }
 
 impl From<reqwest::Error> for ForkError {

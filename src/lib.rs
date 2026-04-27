@@ -46,10 +46,12 @@ mod cache;
 mod error;
 mod rpc;
 mod source;
+pub mod trace;
 
 pub use error::{ForkError, Result};
 pub use rpc::{FetchedEntry, LatestLedger, NetworkMetadata, RpcClient, RpcConfig};
 pub use source::{FetchMode, RpcSnapshotSource};
+pub use trace::{Trace, TraceFrame, TraceResult};
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -173,6 +175,56 @@ impl ForkedEnv {
         }
     }
 
+    /// Reconstruct the cross-contract call tree from the host's diagnostic
+    /// event stream.
+    ///
+    /// Returns an empty [`Trace`] if [`ForkConfig::tracing`] was not set
+    /// to `true` at build time, or if no contract calls have happened
+    /// yet.
+    ///
+    /// **Per-invocation scoping.** The host's `InvocationMeter` clears
+    /// the events buffer at the start of every top-level
+    /// `invoke_contract`, so each `trace()` reflects only the most
+    /// recent top-level call — earlier calls' events are gone. This is
+    /// what you usually want for per-test assertions; if you need
+    /// history across multiple invocations, capture each `trace()`
+    /// before the next call.
+    ///
+    /// See [`crate::trace`] for the wire-format details and known
+    /// caveats (single-`Vec`-arg ambiguity, trapped vs. rolled-back
+    /// frames).
+    pub fn trace(&self) -> trace::Trace {
+        let events = self.diagnostic_events();
+        trace::Trace::from_events(&events)
+    }
+
+    /// Print the call-tree to stderr in a Foundry-`-vvvv`-style indented
+    /// format. Convenience for debug sessions; equivalent to
+    /// `eprintln!("{}", env.trace())`.
+    pub fn print_trace(&self) {
+        eprintln!("{}", self.trace());
+    }
+
+    /// Raw access to the host's diagnostic event stream.
+    ///
+    /// Returns an empty [`soroban_env_host::events::Events`] when tracing
+    /// is off or when reading the buffer fails (the failure path is
+    /// extraordinarily rare — host event externalisation only fails on
+    /// budget exhaustion, which means the test was already broken).
+    /// We log the underlying error at `warn!` and hand back an empty
+    /// stream rather than panicking, because `trace()` is most often
+    /// called from a test that's already failing and a panic here would
+    /// hide the original failure.
+    pub fn diagnostic_events(&self) -> soroban_env_host::events::Events {
+        match self.env.host().get_diagnostic_events() {
+            Ok(events) => events,
+            Err(e) => {
+                warn!("soroban-fork: get_diagnostic_events failed: {e:?}");
+                soroban_env_host::events::Events(Vec::new())
+            }
+        }
+    }
+
     /// Explicitly persist the cache. Called automatically on drop when a
     /// `cache_file` is configured, but can be invoked manually — useful
     /// if you want cached state before a panic would drop the env.
@@ -231,6 +283,7 @@ pub struct ForkConfig {
     pinned_timestamp: Option<u64>,
     max_protocol_version: Option<u32>,
     rpc_config: RpcConfig,
+    tracing: bool,
 }
 
 impl ForkConfig {
@@ -254,6 +307,7 @@ impl ForkConfig {
             pinned_timestamp: None,
             max_protocol_version: None,
             rpc_config: RpcConfig::default(),
+            tracing: false,
         }
     }
 
@@ -327,6 +381,28 @@ impl ForkConfig {
     /// batch size). See [`RpcConfig`] for tunables.
     pub fn rpc_config(mut self, config: RpcConfig) -> Self {
         self.rpc_config = config;
+        self
+    }
+
+    /// Enable call-tree tracing.
+    ///
+    /// When `true`, [`Self::build`] flips the host into
+    /// [`DiagnosticLevel::Debug`](soroban_env_host::DiagnosticLevel) so
+    /// every cross-contract call emits `fn_call`/`fn_return` diagnostic
+    /// events. Read the resulting tree via [`ForkedEnv::trace`] or print
+    /// it with [`ForkedEnv::print_trace`].
+    ///
+    /// **Must be set before building the env** — flipping the diagnostic
+    /// level after the first invocation does not retroactively capture
+    /// earlier calls.
+    ///
+    /// **Cost:** the host runs in debug mode, which charges a separate
+    /// "shadow" budget for diagnostic-event bookkeeping. For typical
+    /// integration tests this is negligible; for fuzzing-style workloads
+    /// with thousands of invocations, consider leaving tracing off and
+    /// flipping it on only for the failing case.
+    pub fn tracing(mut self, enabled: bool) -> Self {
+        self.tracing = enabled;
         self
     }
 
@@ -413,6 +489,25 @@ impl ForkConfig {
 
         let env = Env::from_ledger_snapshot(input);
 
+        // We always set the diagnostic level explicitly. soroban-sdk's
+        // `new_for_testutils` unconditionally turns on Debug mode (so its
+        // `auths()` and `events()` hooks always work) — that means our
+        // `tracing(false)` would be a silent lie unless we override.
+        // `set_diagnostic_level` is the public hook; the InvocationMeter
+        // tracks metrics independently of the diagnostic level, so flipping
+        // to None here doesn't break the SDK's other test machinery.
+        let (level, level_label) = if self.tracing {
+            (soroban_env_host::DiagnosticLevel::Debug, "Debug")
+        } else {
+            (soroban_env_host::DiagnosticLevel::None, "None")
+        };
+        env.host().set_diagnostic_level(level).map_err(|e| {
+            error::ForkError::Host(format!("set_diagnostic_level({level_label}) failed: {e:?}"))
+        })?;
+        if self.tracing {
+            info!("soroban-fork: tracing enabled (DiagnosticLevel::Debug)");
+        }
+
         info!("soroban-fork: forked at ledger {sequence} (protocol {protocol_version})");
 
         Ok(ForkedEnv {
@@ -469,7 +564,8 @@ mod tests {
             .fetch_mode(FetchMode::Lenient)
             .at_ledger(12345)
             .pinned_timestamp(999)
-            .max_protocol_version(25);
+            .max_protocol_version(25)
+            .tracing(true);
 
         assert_eq!(cfg.rpc_url, "https://example.test");
         assert_eq!(
@@ -481,6 +577,15 @@ mod tests {
         assert_eq!(cfg.pinned_ledger, Some(12345));
         assert_eq!(cfg.pinned_timestamp, Some(999));
         assert_eq!(cfg.max_protocol_version, Some(25));
+        assert!(cfg.tracing);
+    }
+
+    #[test]
+    fn fork_config_tracing_default_is_off() {
+        // Tracing has a measurable cost (host runs in debug mode + a
+        // separate budget). Default off keeps fast tests fast.
+        let cfg = ForkConfig::new("https://example.test");
+        assert!(!cfg.tracing);
     }
 
     #[test]

@@ -12,7 +12,7 @@ When a test reads a ledger entry that isn't in the local cache, `soroban-fork` f
 
 ```toml
 [dev-dependencies]
-soroban-fork = "0.2"
+soroban-fork = "0.3"
 ```
 
 ## Usage
@@ -93,6 +93,7 @@ ForkConfig::new(rpc_url)           // Soroban RPC endpoint
     .at_ledger(1_234_567)                 // optional: pin the Env's reported sequence
     .pinned_timestamp(1_700_000_000)      // optional: pin the Env's close time
     .max_protocol_version(25)             // optional: cap the protocol the VM reports
+    .tracing(true)                        // optional: capture cross-contract call tree
     .rpc_config(RpcConfig { retries: 5, ..RpcConfig::default() })
     .build()?                             // returns Result<ForkedEnv, ForkError>
 ```
@@ -143,6 +144,43 @@ retries into a thundering herd), 30 s per-request timeout, 200-key batch
 size (Soroban RPC cap). Customize via `.rpc_config(RpcConfig { .. })` on
 the builder. HTTP 408, 425, 429, and 5xx responses are retried; other
 4xx codes fail fast and include the response body for diagnostics.
+
+### Tracing — Foundry-style call trees
+
+Set `.tracing(true)` on the builder to capture cross-contract call trees.
+The host runs in `DiagnosticLevel::Debug`, every `fn_call`/`fn_return`
+emits a diagnostic event, and `env.trace()` reconstructs the tree:
+
+```rust
+let env = ForkConfig::new(rpc_url)
+    .tracing(true)
+    .build()?;
+
+env.invoke_contract::<i128>(&vault, &Symbol::new(&env, "deposit"), args);
+env.print_trace();
+```
+
+```text
+[TRACE]
+  [CABC…XYZ1] deposit(GACC…QRST, 1000000)
+    [CCDE…UVW2] transfer_from(GACC…QRST, CABC…XYZ1, 1000000)
+      ← ()
+    [CFGH…IJK3] invest(1000000)
+      ← 1010000
+    ← 1010000
+```
+
+Programmatic access via `env.trace()` returns a `Trace` with structured
+`TraceFrame`s — useful for asserting call structure or balances inside
+a test. Failed calls render as `[rolled back]`; WASM traps show as
+`TRAPPED (no fn_return)`.
+
+**Per-invocation scoping.** The host's `InvocationMeter` clears the
+events buffer at the start of every top-level `invoke_contract`, so each
+`trace()` reflects only the most recent top-level call. Capture before
+the next call if you need history. See the
+[`trace` module docs](https://docs.rs/soroban-fork/latest/soroban_fork/trace/index.html)
+for wire-format details and caveats (single-`Vec`-arg ambiguity).
 
 ### `RpcSnapshotSource`
 
