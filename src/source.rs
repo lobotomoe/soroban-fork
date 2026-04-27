@@ -4,16 +4,34 @@
 //! in-memory cache first and, on miss, defer to an [`RpcClient`]. Results
 //! (including confirmed-missing entries) are memoized so the second lookup
 //! of the same key is always local.
+//!
+//! # Thread-safety & internal representation
+//!
+//! Cached entries live as **XDR-encoded bytes** in a `Mutex<BTreeMap>`,
+//! decoded back into a fresh `Rc<LedgerEntry>` only when the SDK's
+//! [`SnapshotSource::get`] hands one out across the trait boundary.
+//! Storing bytes (rather than `Rc<LedgerEntry>` directly) is what lets the
+//! struct be `Send + Sync`: `Rc` is intentionally single-threaded, so any
+//! `Rc` inside a shared field would taint the whole type. With bytes, the
+//! shared cache is fully thread-safe; the per-call `Rc` is created on the
+//! consumer's thread inside `get` and never crosses a boundary.
+//!
+//! Decode cost on a cache hit is the XDR-parse of one `LedgerEntry`
+//! (microseconds for typical entries). The cost is paid on every call to
+//! `get`, including hits — if profiling ever shows this on a hot path, a
+//! per-thread parsed-entry memoization layer can be added without changing
+//! the public API.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use log::{info, warn};
 use soroban_env_host::storage::{EntryWithLiveUntil, SnapshotSource};
 use soroban_env_host::xdr::{
-    ContractDataDurability, LedgerEntry, LedgerKey, PublicKey, ScAddress, ScVal,
+    ContractDataDurability, LedgerEntry, LedgerKey, Limits, PublicKey, ReadXdr, ScAddress, ScVal,
+    WriteXdr,
 };
 use soroban_env_host::HostError;
 
@@ -31,6 +49,12 @@ pub enum FetchMode {
     Lenient,
 }
 
+/// Internal cache value: XDR-encoded `LedgerEntry` bytes plus the
+/// `live_until` ledger hint from the RPC. Storing bytes (not a parsed
+/// `LedgerEntry` wrapped in `Rc`) is what gives the source its
+/// `Send + Sync` guarantee — see the module-level docs.
+type CachedBytes = (Vec<u8>, Option<u32>);
+
 /// A [`SnapshotSource`] backed by a Soroban RPC + local cache.
 ///
 /// Cache semantics:
@@ -39,17 +63,16 @@ pub enum FetchMode {
 ///   cache — stops us re-asking for keys we know are absent.
 /// - `None` → we haven't asked yet.
 ///
-/// Thread-safety: this type is **not** `Send`/`Sync`. The cache stores
-/// `EntryWithLiveUntil = (Rc<LedgerEntry>, Option<u32>)` to match the
-/// signature of [`SnapshotSource::get`], and `Rc` is intentionally
-/// single-threaded. Sharing across threads will require switching the
-/// internal representation to XDR bytes (parsed lazily on get) or to
-/// `Arc<LedgerEntry>` plus a boundary clone — that change lands together
-/// with the planned RPC-server mode.
+/// Thread-safety: this type is `Send + Sync`. Wrap it in [`Arc`] to share
+/// across threads — for example, between a future RPC-server worker pool
+/// and the `Env` instances handed to each request. The SDK's
+/// `SnapshotSource` trait still expects an [`Rc`] at its boundary, so a
+/// fresh `Rc<LedgerEntry>` is built per `get` call from cached bytes; the
+/// `Rc` never escapes its caller's thread.
 pub struct RpcSnapshotSource {
-    cache: RefCell<BTreeMap<LedgerKey, Option<EntryWithLiveUntil>>>,
+    cache: Mutex<BTreeMap<LedgerKey, Option<CachedBytes>>>,
     client: Arc<RpcClient>,
-    fetch_count: RefCell<u32>,
+    fetch_count: AtomicU32,
     fetch_mode: FetchMode,
 }
 
@@ -58,9 +81,9 @@ impl RpcSnapshotSource {
     /// and shared with other harnesses (e.g. a pre-warmer).
     pub fn new(client: Arc<RpcClient>) -> Self {
         Self {
-            cache: RefCell::new(BTreeMap::new()),
+            cache: Mutex::new(BTreeMap::new()),
             client,
-            fetch_count: RefCell::new(0),
+            fetch_count: AtomicU32::new(0),
             fetch_mode: FetchMode::Strict,
         }
     }
@@ -77,16 +100,16 @@ impl RpcSnapshotSource {
         &self,
         entries: impl IntoIterator<Item = (LedgerKey, LedgerEntry, Option<u32>)>,
     ) {
-        let mut cache = self.cache.borrow_mut();
+        let mut cache = self.cache.lock().expect("cache mutex poisoned");
         for (key, entry, live_until) in entries {
-            cache.insert(key, Some((Rc::new(entry), live_until)));
+            cache.insert(key, Some((encode_entry(&entry), live_until)));
         }
     }
 
     /// How many RPC round-trips were served through this source since
     /// creation. Useful for asserting cache hit-rates in tests.
     pub fn fetch_count(&self) -> u32 {
-        *self.fetch_count.borrow()
+        self.fetch_count.load(Ordering::Relaxed)
     }
 
     /// Export the cache for persistence. Negative-cache entries (confirmed
@@ -94,25 +117,29 @@ impl RpcSnapshotSource {
     /// processes and bloat the on-disk snapshot.
     pub fn entries(&self) -> Vec<(LedgerKey, LedgerEntry, Option<u32>)> {
         self.cache
-            .borrow()
+            .lock()
+            .expect("cache mutex poisoned")
             .iter()
             .filter_map(|(key, val)| {
                 val.as_ref()
-                    .map(|(entry, live_until)| (key.clone(), entry.as_ref().clone(), *live_until))
+                    .map(|(bytes, live_until)| (key.clone(), decode_entry(bytes), *live_until))
             })
             .collect()
     }
 
+    /// Issue an RPC fetch and memoize whatever we get — including a
+    /// `None` on Lenient errors, matching the original RefCell-era
+    /// behavior. Caching the negative result on a Lenient error means
+    /// later `get`s return `None` immediately without retrying; users
+    /// who want retries should rebuild the env (the cache is per-Source).
     fn fetch_from_rpc(&self, key: &LedgerKey) -> Option<EntryWithLiveUntil> {
-        let count = {
-            let mut c = self.fetch_count.borrow_mut();
-            *c += 1;
-            *c
-        };
+        // `fetch_add` returns the prior value; `+ 1` gives a 1-based
+        // monotonic fetch number that survives concurrent racers.
+        let count = self.fetch_count.fetch_add(1, Ordering::Relaxed) + 1;
 
         info!("soroban-fork: fetch #{count}: {}", key_display(key));
 
-        match self.client.fetch_entry(key) {
+        let result: Option<EntryWithLiveUntil> = match self.client.fetch_entry(key) {
             Ok(Some(fetched)) => Some((Rc::new(fetched.entry), fetched.live_until)),
             Ok(None) => {
                 info!("soroban-fork: fetch #{count}: not found on ledger");
@@ -130,7 +157,19 @@ impl RpcSnapshotSource {
                     None
                 }
             },
-        }
+        };
+
+        // Encode the positive case into bytes for shared storage; persist
+        // negative case as `None` so re-asks for absent keys are local.
+        let cached = result
+            .as_ref()
+            .map(|(rc, live_until)| (encode_entry(rc.as_ref()), *live_until));
+        self.cache
+            .lock()
+            .expect("cache mutex poisoned")
+            .insert(key.clone(), cached);
+
+        result
     }
 }
 
@@ -139,15 +178,54 @@ impl SnapshotSource for RpcSnapshotSource {
         &self,
         key: &Rc<LedgerKey>,
     ) -> std::result::Result<Option<EntryWithLiveUntil>, HostError> {
-        if let Some(cached) = self.cache.borrow().get(key.as_ref()) {
-            return Ok(cached.clone());
+        // Lock briefly: take a clone of the cached value (cheap memcpy of a
+        // small Vec), drop the lock, decode outside the critical section.
+        // Holding the lock across decode would needlessly serialise
+        // concurrent readers.
+        let cached = self
+            .cache
+            .lock()
+            .expect("cache mutex poisoned")
+            .get(key.as_ref())
+            .cloned();
+
+        if let Some(value) = cached {
+            return Ok(value.map(|(bytes, live_until)| (Rc::new(decode_entry(&bytes)), live_until)));
         }
-        let entry = self.fetch_from_rpc(key.as_ref());
-        self.cache
-            .borrow_mut()
-            .insert(key.as_ref().clone(), entry.clone());
-        Ok(entry)
+
+        Ok(self.fetch_from_rpc(key.as_ref()))
     }
+}
+
+// ---------------------------------------------------------------------------
+// XDR codec helpers
+// ---------------------------------------------------------------------------
+
+/// Encode a `LedgerEntry` to its XDR byte representation.
+///
+/// Panics if encoding fails. With `Limits::none()` there are no size caps,
+/// so a failure here means the input was structurally invalid (e.g.
+/// malformed XDR enum discriminant) — that's a bug in whoever produced the
+/// `LedgerEntry`, not a runtime condition we can recover from gracefully.
+fn encode_entry(entry: &LedgerEntry) -> Vec<u8> {
+    entry
+        .to_xdr(Limits::none())
+        .unwrap_or_else(|e| panic!("soroban-fork: LedgerEntry encode failed (structural bug): {e}"))
+}
+
+/// Decode an XDR-encoded `LedgerEntry`.
+///
+/// Panics if decoding fails. We only ever decode bytes we encoded
+/// ourselves (via `encode_entry` or via `LedgerSnapshot` JSON load) so a
+/// failure here means the cache contents are corrupted — possible memory
+/// issue or a manual edit of the cache file. Either way, not recoverable.
+fn decode_entry(bytes: &[u8]) -> LedgerEntry {
+    LedgerEntry::from_xdr(bytes, Limits::none()).unwrap_or_else(|e| {
+        panic!(
+            "soroban-fork: cached LedgerEntry decode failed — cache corruption or \
+             XDR-version mismatch: {e}"
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +304,40 @@ fn abbreviate(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_env_host::xdr::{ConfigSettingId, LedgerKeyConfigSetting};
+    use soroban_env_host::xdr::{
+        ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerEntryExt,
+        LedgerKeyConfigSetting,
+    };
+
+    /// Compile-time guarantee: the source MUST be `Send + Sync` so it can
+    /// live behind `Arc` and be shared across threads. If a future change
+    /// reintroduces an `Rc` or `RefCell` field, this stops compiling.
+    #[allow(dead_code)]
+    fn _assert_send_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<RpcSnapshotSource>();
+        assert_sync::<RpcSnapshotSource>();
+    }
+
+    fn dummy_client() -> Arc<RpcClient> {
+        Arc::new(
+            RpcClient::new("http://localhost:0", crate::rpc::RpcConfig::default())
+                .expect("client construction should not fail"),
+        )
+    }
+
+    fn dummy_entry(last_modified: u32) -> (LedgerKey, LedgerEntry, Option<u32>) {
+        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::ContractMaxSizeBytes,
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: last_modified,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractMaxSizeBytes(65_536)),
+            ext: LedgerEntryExt::V0,
+        };
+        (key, entry, None)
+    }
 
     #[test]
     fn abbreviate_short_string_is_unchanged() {
@@ -258,11 +369,80 @@ mod tests {
     fn fetch_mode_default_is_strict() {
         // Documented contract: new sources start in Strict until explicitly
         // opted down. Keep this test as a guard against silent regressions.
-        let client = Arc::new(
-            RpcClient::new("http://localhost:0", crate::rpc::RpcConfig::default())
-                .expect("client construction should not fail"),
-        );
-        let src = RpcSnapshotSource::new(client);
+        let src = RpcSnapshotSource::new(dummy_client());
         assert_eq!(src.fetch_mode, FetchMode::Strict);
+    }
+
+    #[test]
+    fn xdr_round_trip_preserves_ledger_entry() {
+        // The cache stores XDR bytes; correctness depends on encode/decode
+        // being a true identity. If a future XDR-codec change ever broke
+        // round-tripping, every cache hit would silently corrupt state —
+        // this test pins the invariant.
+        let (_, entry, _) = dummy_entry(42);
+        let encoded = encode_entry(&entry);
+        let decoded = decode_entry(&encoded);
+        assert_eq!(entry, decoded);
+        // And re-encoding the decoded value must reproduce the same bytes.
+        assert_eq!(encoded, encode_entry(&decoded));
+    }
+
+    #[test]
+    fn preload_then_entries_round_trips() {
+        let src = RpcSnapshotSource::new(dummy_client());
+        let original = vec![dummy_entry(7)];
+        src.preload(original.clone());
+        let exported = src.entries();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].0, original[0].0);
+        assert_eq!(exported[0].1, original[0].1);
+        assert_eq!(exported[0].2, original[0].2);
+    }
+
+    #[test]
+    fn get_returns_preloaded_entry() {
+        let src = RpcSnapshotSource::new(dummy_client());
+        let (key, entry, live_until) = dummy_entry(99);
+        src.preload(vec![(key.clone(), entry.clone(), live_until)]);
+
+        let key_rc = Rc::new(key);
+        let result = src.get(&key_rc).expect("get should not error");
+        let (got_entry, got_live_until) = result.expect("preloaded entry should be present");
+        assert_eq!(got_entry.as_ref(), &entry);
+        assert_eq!(got_live_until, live_until);
+        // Preloads do not count as fetches.
+        assert_eq!(src.fetch_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_reads_of_preloaded_entry_are_race_free() {
+        // Eight threads racing through `get` on the same preloaded key.
+        // No fetch should fire (count stays 0). With RefCell the borrow
+        // would panic; with Mutex<bytes>, we get correct shared access.
+        use std::thread;
+        let src = Arc::new(RpcSnapshotSource::new(dummy_client()));
+        let (key, entry, live_until) = dummy_entry(123);
+        src.preload(vec![(key.clone(), entry.clone(), live_until)]);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let src = Arc::clone(&src);
+            let key = key.clone();
+            let entry = entry.clone();
+            handles.push(thread::spawn(move || {
+                let key_rc = Rc::new(key);
+                for _ in 0..100 {
+                    let got = src
+                        .get(&key_rc)
+                        .expect("get should not error")
+                        .expect("entry should be present");
+                    assert_eq!(got.0.as_ref(), &entry);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+        assert_eq!(src.fetch_count(), 0, "no RPC fetches should have fired");
     }
 }

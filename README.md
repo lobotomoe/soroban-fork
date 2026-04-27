@@ -12,7 +12,7 @@ When a test reads a ledger entry that isn't in the local cache, `soroban-fork` f
 
 ```toml
 [dev-dependencies]
-soroban-fork = "0.3"
+soroban-fork = "0.4"
 ```
 
 ## Usage
@@ -192,10 +192,16 @@ use soroban_fork::{RpcSnapshotSource, RpcConfig};
 use soroban_fork::RpcClient; // re-exported
 
 let client = Arc::new(RpcClient::new("https://soroban-testnet.stellar.org:443", RpcConfig::default())?);
-let source = RpcSnapshotSource::new(client);
+let source = Arc::new(RpcSnapshotSource::new(client));
 source.preload(entries);          // pre-load entries from a snapshot file
 let all_entries = source.entries();  // export for persistence
 ```
+
+`RpcSnapshotSource` is `Send + Sync`, so it can be wrapped in `Arc` and
+shared across threads — useful for parallel test runners and the
+upcoming RPC-server mode. Internally the cache stores XDR-encoded bytes
+and parses to `LedgerEntry` only at the SDK boundary, so no `Rc` ever
+crosses threads.
 
 ### Errors
 
