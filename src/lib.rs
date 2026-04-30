@@ -50,6 +50,7 @@ mod rpc;
 mod source;
 pub mod test_accounts;
 pub mod trace;
+pub mod workspace;
 
 /// JSON-RPC server mode. Available with the `server` cargo feature —
 /// pulls in tokio + axum + tower-http; library-mode users (default)
@@ -62,6 +63,7 @@ pub use error::{ForkError, Result};
 pub use rpc::{FetchedEntry, LatestLedger, NetworkMetadata, RpcClient, RpcConfig};
 pub use source::{FetchMode, RpcSnapshotSource};
 pub use trace::{Trace, TraceFrame, TraceResult};
+pub use workspace::{workspace_wasm, workspace_wasm_with};
 
 use std::cell::OnceCell;
 use std::path::PathBuf;

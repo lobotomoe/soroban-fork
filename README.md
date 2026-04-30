@@ -319,7 +319,7 @@ What makes the toolset matter, in one test:
 
 Two cheatcode calls and a contract is callable. That's the Foundry-`vm.etch`-equivalent — the headline reason this toolset exists. Live in [`server_cheatcode_only_deploy_coexists_with_mainnet`](tests/server_smoke.rs); end-to-end against mainnet, ~70 LoC.
 
-### Methods supported in v0.9.0
+### Methods supported in v0.9.1
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -424,7 +424,7 @@ client can distinguish "this works against any Stellar RPC" from
   staleness) past thresholds without orchestrating real
   transactions.
 
-### What v0.9.0 server does NOT support
+### What v0.9.1 server does NOT support
 
 Listed up front so nothing surprises you:
 
@@ -665,11 +665,36 @@ were on disk the last time `stellar contract build` ran.
 You will see tests pass against stale wasm. The symptom is "I fixed the
 contract but the test still observes the old behaviour."
 
-Workarounds (pick one):
+The fix shipped in v0.9.1 is `soroban_fork::workspace_wasm`:
 
-- **Rebuild manually:** add `stellar contract build` to your Makefile / justfile / CI step. Run it before `cargo test`.
-- **Cheap automation:** add a `build.rs` to your test crate that runs `stellar contract build` on the contract crate, with `cargo:rerun-if-changed=` lines pointing at the source files.
-- **Long-term:** a `ForkConfig::register_wasm_from_workspace(crate_name)` helper that rebuilds + caches by hash is planned for **v0.9.x**.
+```rust
+let wasm = soroban_fork::workspace_wasm("my_contract")
+    .expect("build my_contract for wasm32v1-none");
+// Pass `wasm` to whatever needs the bytes — Env::register, an
+// UploadContractWasm envelope, fork_setCode over JSON-RPC, etc.
+```
+
+It runs `cargo build -p my_contract --target wasm32v1-none --release`
+at test runtime and reads the resulting `.wasm` file. Cargo's
+incremental compilation keeps the rebuild cheap when the source
+hasn't actually changed (sub-second on small crates). Because the
+build runs every time you call `workspace_wasm`, the bytes are always
+in sync with the source — the trap closes.
+
+Layout assumption: `my_contract` is a member of the same Cargo
+workspace as the test, with a `cdylib` target. The workspace root is
+located via `cargo metadata`, so `CARGO_TARGET_DIR` overrides are
+honored automatically. See [`workspace`
+module docs](https://docs.rs/soroban-fork/latest/soroban_fork/workspace/index.html)
+for `workspace_wasm_with(crate_name, target, profile)` if you need to
+override the default target/profile.
+
+For test suites that load wasm in many places, the cheaper alternative
+is a `build.rs` in the test crate that runs `cargo build -p <contract>`
+once per `cargo test` invocation (and emits `cargo:rerun-if-changed=`
+directives on the contract's source files). That keeps the compile
+cost out of every individual test. Pick whichever fits — `workspace_wasm`
+is the smaller diff for most projects.
 
 ### `cache_file` for cheap CI
 

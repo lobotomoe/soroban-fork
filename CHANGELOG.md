@@ -8,6 +8,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-05-01
+
+### Added
+- **`workspace_wasm(crate_name)`** — closes the `include_bytes!`
+  rebuild trap reported in the v0.8 user feedback round. Invokes
+  `cargo build -p <crate_name> --target wasm32v1-none --release` at
+  test runtime, then reads the resulting WASM bytes. Cargo's
+  incremental compilation makes the rebuild sub-second when the source
+  hasn't actually changed, so calling this helper on every test is
+  cheap. Crate name is validated against `cargo metadata`'s
+  `packages[].name` cross-referenced with `workspace_members` — names
+  must match exactly (no substring matching). `CARGO_TARGET_DIR`
+  overrides are honored.
+- **`workspace_wasm_with(crate_name, target, profile)`** — escape hatch
+  for projects pinned to an older Soroban target
+  (`wasm32-unknown-unknown` for soroban-sdk <25, etc.) or non-`release`
+  profiles for size optimisation.
+- New `workspace` module exposing both helpers, re-exported at the
+  crate root (`soroban_fork::workspace_wasm` and
+  `soroban_fork::workspace_wasm_with`).
+- `ForkError::Workspace(String)` variant — surfaced verbatim from
+  cargo's stderr when `cargo metadata` or `cargo build` fails, so a
+  failing test reports the underlying compilation error directly.
+- Module-level docs explain the rebuild-trap rationale and document
+  the `build.rs` alternative for test suites that load wasm in many
+  places (cheaper than running `cargo build` per test).
+
+### Fixed
+- Cargo ≥ 1.77 emits workspace-member IDs in two formats: with an
+  explicit `<name>@<version>` suffix when the crate name differs from
+  the directory basename, and *without* the `@<version>` suffix when
+  they match. The first iteration of `workspace_wasm` only handled
+  the explicit form and rejected legitimate workspace members. Caught
+  by an end-to-end smoke test against a real `demo_contract`
+  workspace fixture; fixed by switching to the `packages[].name`
+  cross-reference, which is stable across Cargo versions.
+
+### Notes
+- This is the smallest of the v0.8 paper-cuts left after v0.8.8 docs
+  and v0.9.0 auth_tree introspection. With it, every actionable item
+  from the original integrator-feedback round is closed except the
+  ones that need upstream `rs-soroban-env` cooperation
+  (`strict_auth(true)`, `last_auth_failure()`).
+
 ## [0.9.0] — 2026-05-01
 
 ### Added
@@ -393,7 +437,8 @@ non-standard extensions, not bare overrides of Stellar RPC methods.
   from a Soroban RPC endpoint. Compatible with the `LedgerSnapshot` JSON
   format (`stellar snapshot create` interop).
 
-[Unreleased]: https://github.com/lobotomoe/soroban-fork/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/lobotomoe/soroban-fork/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/lobotomoe/soroban-fork/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.8...v0.9.0
 [0.8.8]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.7...v0.8.8
 [0.8.7]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.6...v0.8.7

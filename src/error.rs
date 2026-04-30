@@ -59,6 +59,17 @@ pub enum ForkError {
     /// through this enum — that's an SDK boundary we don't reach across.
     #[error("host operation failed: {0}")]
     Host(String),
+
+    /// Building or locating a workspace member's contract WASM failed.
+    ///
+    /// Emitted by [`super::workspace_wasm`] when `cargo metadata` /
+    /// `cargo build` fails, when the named crate isn't a workspace
+    /// member, or when the expected `.wasm` artifact is missing or
+    /// unreadable after a successful build. The message carries the
+    /// underlying cause verbatim — compilation errors from cargo
+    /// surface as-is so the failing test reports them straight.
+    #[error("workspace contract build error: {0}")]
+    Workspace(String),
 }
 
 impl From<reqwest::Error> for ForkError {
