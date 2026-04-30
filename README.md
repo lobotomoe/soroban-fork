@@ -182,6 +182,51 @@ the next call if you need history. See the
 [`trace` module docs](https://docs.rs/soroban-fork/latest/soroban_fork/trace/index.html)
 for wire-format details and caveats (single-`Vec`-arg ambiguity).
 
+### Auth introspection — `print_auth_tree`
+
+When debugging cross-contract authorization (`Error(Auth, InvalidAction)`,
+unexpected `require_auth` panics, "did Alice actually have to sign this?"),
+read out the recording auth manager's payload set:
+
+```rust
+let env = ForkConfig::new(rpc_url).build()?;
+env.mock_all_auths();
+
+env.invoke_contract::<()>(&usdc, &Symbol::new(&env, "transfer"), args);
+
+env.print_auth_tree();
+```
+
+```text
+[AUTH]
+  payload #0  signer=GA62…J3CT  nonce=5541220902715666415
+    [CCW6…MI75] transfer(GA62…J3CT, GB7O…7AMM, 250000000)
+```
+
+Programmatic access via `env.auth_tree()` returns an
+[`AuthTree`](https://docs.rs/soroban-fork/latest/soroban_fork/auth_tree/struct.AuthTree.html)
+with `payload_count()` / `invocation_count()` / `is_empty()` accessors —
+useful for asserting that a multi-hop call demanded exactly the expected
+number of `require_auth`s. Raw `Vec<RecordedAuthPayload>` is available
+via `env.auth_payloads()`.
+
+**Per-invocation scoping**, like `trace()`: only payloads from the most
+recent top-level `invoke_contract` are visible.
+
+**Limits inherited from the upstream host crate**, documented honestly:
+
+- `Error(Auth, InvalidAction)` carries only the address — the failed
+  contract / function / expected authorizer are constructed locally
+  inside the host and not persisted to any accessor we can read out.
+  After a failed call, `auth_tree()` reflects whatever payload set the
+  host left in its `previous_authorization_manager`; the exact contents
+  after a panic mid-invocation are an implementation detail of
+  `soroban-env-host`. A structured `last_auth_failure()` awaits an
+  upstream change.
+- Whether `mock_all_auths_allowing_non_root_auth` was used is not
+  exposed by the host. The README's "Common pitfalls" section documents
+  the trap; an enforceable `strict_auth` mode awaits an upstream change.
+
 ## JSON-RPC server mode
 
 Library mode (everything above) is for Rust tests. **Server mode** turns
@@ -274,7 +319,7 @@ What makes the toolset matter, in one test:
 
 Two cheatcode calls and a contract is callable. That's the Foundry-`vm.etch`-equivalent — the headline reason this toolset exists. Live in [`server_cheatcode_only_deploy_coexists_with_mainnet`](tests/server_smoke.rs); end-to-end against mainnet, ~70 LoC.
 
-### Methods supported in v0.8.8
+### Methods supported in v0.9.0
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -379,7 +424,7 @@ client can distinguish "this works against any Stellar RPC" from
   staleness) past thresholds without orchestrating real
   transactions.
 
-### What v0.8.8 server does NOT support
+### What v0.9.0 server does NOT support
 
 Listed up front so nothing surprises you:
 
@@ -604,7 +649,10 @@ relaxed variant when you can name which non-root authorisations you're
 intentionally bypassing — and document why in a comment.
 
 A `ForkConfig::strict_auth(true)` switch that refuses the relaxed variant
-on the env is planned for **v0.9.0**.
+on the env was scoped for v0.9.0 but **dropped** when research showed the
+host's `disable_non_root_auth` flag has no public getter — any
+implementation we shipped would have been a half-measure with no real
+enforcement. Will revisit if `rs-soroban-env` adds an accessor.
 
 ### `include_bytes!("…wasm")` does not rebuild the wasm
 
@@ -642,15 +690,25 @@ let env = ForkConfig::new(rpc_url)
 
 ### Debugging cross-contract auth chains
 
-When you see `Error(Auth, InvalidAction)` and the panic message alone isn't
-enough, enable `.tracing(true)` and call `env.print_trace()` after the failed
-call — the rolled-back frame surfaces which contract refused which
-authorisation. See [Tracing](#tracing--foundry-style-call-trees) above.
+When you see `Error(Auth, InvalidAction)` or unexpected `require_auth`
+panics, two complementary tools cover most cases:
 
-A dedicated `env.print_auth_tree()` (current `AuthorizedInvocation` tree dump)
-and `env.last_auth_failure()` (structured info on the most recent
-`InvalidAction`) are planned for **v0.9.0** as the headline diagnostics
-upgrade.
+- `env.print_auth_tree()` *(new in v0.9.0)* — dumps the recording auth
+  manager's payload set as a Foundry-style indented tree. Names every
+  signer, nonce, contract, function, and arg list that `require_auth`
+  was demanded for during the most recent top-level invocation. See
+  [Auth introspection](#auth-introspection--print_auth_tree) above.
+- `env.print_trace()` (with `.tracing(true)` on the builder) — dumps
+  the cross-contract call tree. The rolled-back frame surfaces which
+  contract refused which authorisation. See
+  [Tracing](#tracing--foundry-style-call-trees) above.
+
+A structured `env.last_auth_failure()` accessor — exact contract,
+function, expected authorizer that fired the `InvalidAction` — was
+scoped for v0.9.0 but **dropped** when research showed the host
+constructs the failure with only the address in its diagnostic args
+and discards the rest. Will revisit if `rs-soroban-env` persists the
+failure context.
 
 ### `into_val(&env)` and `ForkedEnv`
 

@@ -331,7 +331,10 @@ fn render_frame(f: &mut fmt::Formatter<'_>, frame: &TraceFrame, depth: usize) ->
 /// Intentionally not exhaustive on every variant — exotic ones fall back
 /// to `Debug`. The goal is "readable in a forge-style log", not a
 /// round-trip-faithful encoder.
-fn render_scval(f: &mut fmt::Formatter<'_>, v: &ScVal) -> fmt::Result {
+///
+/// Visible to `crate::auth_tree` so the auth-payload renderer produces
+/// arguments in the same shape as the trace renderer.
+pub(crate) fn render_scval(f: &mut fmt::Formatter<'_>, v: &ScVal) -> fmt::Result {
     match v {
         ScVal::Void => write!(f, "()"),
         ScVal::Bool(b) => write!(f, "{b}"),
@@ -402,7 +405,9 @@ fn render_map(f: &mut fmt::Formatter<'_>, entries: &[ScMapEntry]) -> fmt::Result
     write!(f, "}}")
 }
 
-fn render_address(
+/// Compact rendering for an `ScAddress`. Visible to `crate::auth_tree` for
+/// the same reason as [`render_scval`].
+pub(crate) fn render_address(
     f: &mut fmt::Formatter<'_>,
     addr: &soroban_env_host::xdr::ScAddress,
 ) -> fmt::Result {

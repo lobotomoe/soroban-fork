@@ -8,6 +8,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-05-01
+
+### Added
+- **`ForkedEnv::auth_tree()`** — Foundry-`-vvvv`-style introspection of
+  the recording auth manager's payload set after a top-level
+  `invoke_contract`. Names every signer, nonce, contract, function, and
+  arg list that `require_auth` was demanded for. Closes the
+  longest-running paper-cut from the v0.8 user feedback round
+  ("`Error(Auth, InvalidAction)` is a black box; the panic message
+  alone isn't enough").
+- **`ForkedEnv::print_auth_tree()`** — convenience wrapper that prints
+  to stderr, parallel to `print_trace()`.
+- **`ForkedEnv::auth_payloads()`** — raw access to
+  `Vec<RecordedAuthPayload>` for programmatic assertions, parallel to
+  `diagnostic_events()`.
+- New `auth_tree` module exposing `AuthTree` with `payload_count()`,
+  `invocation_count()` (recursive across `sub_invocations`), and
+  `is_empty()` accessors.
+- `tests/auth_debug.rs` — live-mainnet showcase. Verified output:
+  ```text
+  [AUTH]
+    payload #0  signer=GA62…J3CT  nonce=5541220902715666415
+      [CCW6…MI75] transfer(GA62…J3CT, GB7O…7AMM, 250000000)
+  ```
+- README "Auth introspection" section under the `## API` heading,
+  cross-linked from "Common pitfalls / Debugging cross-contract auth
+  chains".
+
+### Changed
+- `trace::render_scval` and `trace::render_address` are now
+  `pub(crate)` so the auth-tree renderer produces arguments in the
+  same shape as the trace renderer (single source of truth for compact
+  `ScVal` / `ScAddress` formatting).
+
+### Dropped from scope (will not ship)
+- ~~`ForkConfig::strict_auth(true)`~~ — research showed the host's
+  `disable_non_root_auth` flag has no public getter. Any
+  implementation we shipped would have been a half-measure with no
+  real enforcement; we'd rather document the trap (which v0.8.8 already
+  did in the "Common pitfalls" README section) than ship a stub.
+  Re-evaluate when `rs-soroban-env` exposes the flag.
+- ~~`ForkedEnv::last_auth_failure()`~~ — research showed
+  `(Auth, InvalidAction)` is constructed locally inside the host with
+  only the address in its diagnostic args; the failed contract,
+  function, and expected authorizer are not persisted to any accessor
+  we can read out. The honest partial answer (`auth_tree()` after a
+  failed call shows what was recorded before the failure point) is
+  documented in the `auth_tree` module docs and the README.
+  Re-evaluate when `rs-soroban-env` persists the failure context.
+
+### Notes
+- This release responds directly to the first integrator feedback
+  round (see v0.8.8 CHANGELOG). v0.8.8 shipped pure docs covering all
+  five paper-cuts; v0.9.0 ships the largest of the auth-related
+  features the docs pointed at as "planned".
+- The `wasm rebuild trap` mitigation
+  (`ForkConfig::register_wasm_from_workspace`) is deferred to v0.9.x.
+
 ## [0.8.8] — 2026-05-01
 
 ### Added
@@ -335,7 +393,8 @@ non-standard extensions, not bare overrides of Stellar RPC methods.
   from a Soroban RPC endpoint. Compatible with the `LedgerSnapshot` JSON
   format (`stellar snapshot create` interop).
 
-[Unreleased]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.8...HEAD
+[Unreleased]: https://github.com/lobotomoe/soroban-fork/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.8...v0.9.0
 [0.8.8]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.7...v0.8.8
 [0.8.7]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.5...v0.8.6

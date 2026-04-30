@@ -42,6 +42,7 @@
 #![warn(clippy::all)]
 #![warn(rust_2018_idioms)]
 
+pub mod auth_tree;
 mod cache;
 mod error;
 pub mod fees;
@@ -56,6 +57,7 @@ pub mod trace;
 #[cfg(feature = "server")]
 pub mod server;
 
+pub use auth_tree::AuthTree;
 pub use error::{ForkError, Result};
 pub use rpc::{FetchedEntry, LatestLedger, NetworkMetadata, RpcClient, RpcConfig};
 pub use source::{FetchMode, RpcSnapshotSource};
@@ -360,6 +362,55 @@ impl ForkedEnv {
             Err(e) => {
                 warn!("soroban-fork: get_diagnostic_events failed: {e:?}");
                 soroban_env_host::events::Events(Vec::new())
+            }
+        }
+    }
+
+    /// Reconstruct the recording-mode authorization tree from the host's
+    /// last top-level invocation.
+    ///
+    /// Returns an empty [`AuthTree`] in two cases:
+    /// 1. No top-level `invoke_contract` has run yet — the host has no
+    ///    "previous invocation" to read payloads from.
+    /// 2. The invocation completed but made no `require_auth` demands.
+    ///
+    /// Both are normal, not errors. We log the underlying host error at
+    /// `warn!` and hand back an empty tree, mirroring [`Self::trace`].
+    /// A failing test that calls this method to debug an auth issue
+    /// should not be made worse by a panic from the debug helper itself.
+    ///
+    /// **Per-invocation scoping.** Like [`Self::trace`], the recorded
+    /// payloads reflect only the most recent top-level invocation;
+    /// earlier invocations' payloads are gone. Capture each
+    /// `auth_tree()` before the next call if you need history.
+    ///
+    /// See [`crate::auth_tree`] for the limits inherited from
+    /// `soroban-env-host` (no `last_auth_failure`, no enforceable
+    /// `strict_auth` mode flag).
+    pub fn auth_tree(&self) -> AuthTree {
+        AuthTree::from_payloads(self.auth_payloads())
+    }
+
+    /// Print the auth tree to stderr in a Foundry-`-vvvv`-style indented
+    /// format. Convenience for debug sessions; equivalent to
+    /// `eprintln!("{}", env.auth_tree())`.
+    pub fn print_auth_tree(&self) {
+        eprintln!("{}", self.auth_tree());
+    }
+
+    /// Raw access to the host's recorded auth payloads from the last
+    /// top-level invocation.
+    ///
+    /// Parallel to [`Self::diagnostic_events`]. Returns an empty `Vec`
+    /// (with a `warn!` log) on host error rather than propagating —
+    /// most callers reach for this from a debug context where a panic
+    /// in the helper would hide the original failure.
+    pub fn auth_payloads(&self) -> Vec<soroban_env_host::auth::RecordedAuthPayload> {
+        match self.env.host().get_recorded_auth_payloads() {
+            Ok(payloads) => payloads,
+            Err(e) => {
+                warn!("soroban-fork: get_recorded_auth_payloads failed: {e:?}");
+                Vec::new()
             }
         }
     }
