@@ -8,6 +8,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-05-01
+
+### Added
+- **`workspace_wasm_in(manifest_dir, crate_name, target, profile)`** —
+  the most general form of the workspace-wasm helper. Takes an
+  optional explicit `manifest_dir` so the caller can root cargo
+  invocations at a specific directory instead of inheriting the
+  process's cwd. `workspace_wasm` and `workspace_wasm_with` are now
+  thin wrappers that pass `None`.
+- **`tests/workspace_wasm.rs`** — closes the testability gap that
+  shipped with v0.9.1. Two scenarios:
+  - `errors_when_crate_is_not_a_workspace_member` — runs
+    unconditionally in CI. Spins up a fixture workspace in a tempdir
+    and asserts that requesting an unknown crate produces a
+    well-formed `ForkError::Workspace` with the missing name and the
+    actual workspace members listed.
+  - `builds_real_contract_in_isolated_workspace` — `#[ignore]`d
+    end-to-end test. Writes a 2-crate fixture (root + a tiny
+    `cdylib` Soroban contract), invokes `workspace_wasm_in`, and
+    verifies the resulting WASM starts with the `\\0asm` magic. Run
+    with `cargo test --test workspace_wasm -- --ignored`. Builds 619
+    bytes on macOS / soroban-sdk 25.3.0 — exactly matching the
+    one-time smoke test that backed the v0.9.1 release.
+
+### Why this exists
+- v0.9.1 shipped with the public `workspace_wasm` exercising no
+  automated test path. The end-to-end was a manual smoke at
+  `/tmp/sfork-smoke` that didn't survive past the release. v0.9.2
+  closes that gap honestly: with the new `manifest_dir` seam, the
+  same end-to-end coverage now lives in `tests/workspace_wasm.rs`
+  and is reproducible by anyone running the test suite.
+- The unconditional error-path test means even default `cargo test`
+  exercises the metadata-parsing pipeline against a real cargo
+  invocation, not just unit-test mocks.
+
+### Notes
+- No behavioural change to `workspace_wasm` / `workspace_wasm_with`
+  for existing callers — they delegate to the new
+  `workspace_wasm_in(None, …)` form.
+- The integration test fixture is allocated under
+  `std::env::temp_dir()` with a pid + nanosecond suffix so concurrent
+  cargo `--test-threads=N` runs never collide.
+
 ## [0.9.1] — 2026-05-01
 
 ### Added
@@ -437,7 +480,8 @@ non-standard extensions, not bare overrides of Stellar RPC methods.
   from a Soroban RPC endpoint. Compatible with the `LedgerSnapshot` JSON
   format (`stellar snapshot create` interop).
 
-[Unreleased]: https://github.com/lobotomoe/soroban-fork/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/lobotomoe/soroban-fork/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/lobotomoe/soroban-fork/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/lobotomoe/soroban-fork/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.8...v0.9.0
 [0.8.8]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.7...v0.8.8

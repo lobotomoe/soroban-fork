@@ -52,7 +52,7 @@
 //! tradeoff.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{ForkError, Result};
@@ -86,7 +86,7 @@ const DEFAULT_PROFILE: &str = "release";
 /// - The expected `.wasm` artifact is missing or unreadable after a
 ///   successful build.
 pub fn workspace_wasm(crate_name: &str) -> Result<Vec<u8>> {
-    workspace_wasm_with(crate_name, DEFAULT_TARGET, DEFAULT_PROFILE)
+    workspace_wasm_in(None, crate_name, DEFAULT_TARGET, DEFAULT_PROFILE)
 }
 
 /// Like [`workspace_wasm`], but with an explicit build target triple
@@ -94,11 +94,37 @@ pub fn workspace_wasm(crate_name: &str) -> Result<Vec<u8>> {
 /// target (`wasm32-unknown-unknown` for soroban-sdk <25, for
 /// example) or a non-`release` profile for size optimisation.
 pub fn workspace_wasm_with(crate_name: &str, target: &str, profile: &str) -> Result<Vec<u8>> {
-    let metadata = read_metadata()?;
+    workspace_wasm_in(None, crate_name, target, profile)
+}
+
+/// Most general form of the helper: explicit `manifest_dir` selects which
+/// workspace's `cargo metadata` / `cargo build` we run, instead of
+/// inheriting the calling process's current directory.
+///
+/// Pass `None` to use the calling process's cwd — that's what
+/// [`workspace_wasm`] and [`workspace_wasm_with`] do, and it's right
+/// for the typical "I'm in my test crate inside the workspace" case.
+///
+/// Pass `Some(dir)` to root the cargo invocations at an explicit
+/// directory. This exists so integration tests can spin up a fixture
+/// workspace in a tempdir without polluting the test harness's own
+/// cwd, and it's the testing seam that lets the
+/// [tests/workspace_wasm.rs][int] integration test exercise the full
+/// build pipeline without modifying soroban-fork itself into a
+/// workspace.
+///
+/// [int]: https://github.com/lobotomoe/soroban-fork/blob/main/tests/workspace_wasm.rs
+pub fn workspace_wasm_in(
+    manifest_dir: Option<&Path>,
+    crate_name: &str,
+    target: &str,
+    profile: &str,
+) -> Result<Vec<u8>> {
+    let metadata = read_metadata(manifest_dir)?;
     let target_dir = extract_target_dir(&metadata)?;
     require_workspace_member(&metadata, crate_name)?;
 
-    invoke_cargo_build(crate_name, target, profile)?;
+    invoke_cargo_build(manifest_dir, crate_name, target, profile)?;
 
     let wasm_path = target_dir
         .join(target)
@@ -126,9 +152,13 @@ fn cargo_bin() -> OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
 }
 
-fn read_metadata() -> Result<serde_json::Value> {
-    let output = Command::new(cargo_bin())
-        .args(["metadata", "--no-deps", "--format-version=1"])
+fn read_metadata(manifest_dir: Option<&Path>) -> Result<serde_json::Value> {
+    let mut cmd = Command::new(cargo_bin());
+    cmd.args(["metadata", "--no-deps", "--format-version=1"]);
+    if let Some(dir) = manifest_dir {
+        cmd.current_dir(dir);
+    }
+    let output = cmd
         .output()
         .map_err(|e| ForkError::Workspace(format!("failed to spawn `cargo metadata`: {e}")))?;
     if !output.status.success() {
@@ -196,7 +226,12 @@ fn require_workspace_member(metadata: &serde_json::Value, crate_name: &str) -> R
     )))
 }
 
-fn invoke_cargo_build(crate_name: &str, target: &str, profile: &str) -> Result<()> {
+fn invoke_cargo_build(
+    manifest_dir: Option<&Path>,
+    crate_name: &str,
+    target: &str,
+    profile: &str,
+) -> Result<()> {
     let mut cmd = Command::new(cargo_bin());
     cmd.args(["build", "-p", crate_name, "--target", target]);
     // Cargo accepts `--release` as sugar for `--profile=release` and
@@ -211,6 +246,9 @@ fn invoke_cargo_build(crate_name: &str, target: &str, profile: &str) -> Result<(
         other => {
             cmd.args(["--profile", other]);
         }
+    }
+    if let Some(dir) = manifest_dir {
+        cmd.current_dir(dir);
     }
     let status = cmd
         .status()

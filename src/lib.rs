@@ -63,7 +63,7 @@ pub use error::{ForkError, Result};
 pub use rpc::{FetchedEntry, LatestLedger, NetworkMetadata, RpcClient, RpcConfig};
 pub use source::{FetchMode, RpcSnapshotSource};
 pub use trace::{Trace, TraceFrame, TraceResult};
-pub use workspace::{workspace_wasm, workspace_wasm_with};
+pub use workspace::{workspace_wasm, workspace_wasm_in, workspace_wasm_with};
 
 use std::cell::OnceCell;
 use std::path::PathBuf;

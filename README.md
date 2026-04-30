@@ -319,7 +319,7 @@ What makes the toolset matter, in one test:
 
 Two cheatcode calls and a contract is callable. That's the Foundry-`vm.etch`-equivalent — the headline reason this toolset exists. Live in [`server_cheatcode_only_deploy_coexists_with_mainnet`](tests/server_smoke.rs); end-to-end against mainnet, ~70 LoC.
 
-### Methods supported in v0.9.1
+### Methods supported in v0.9.2
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -424,7 +424,7 @@ client can distinguish "this works against any Stellar RPC" from
   staleness) past thresholds without orchestrating real
   transactions.
 
-### What v0.9.1 server does NOT support
+### What v0.9.2 server does NOT support
 
 Listed up front so nothing surprises you:
 
