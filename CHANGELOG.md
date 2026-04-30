@@ -8,6 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.8] — 2026-05-01
+
+### Added
+- **Common pitfalls** section in `README.md`, covering five paper-cuts
+  reported by the first real integrator wiring soroban-fork into a
+  Blend-style mainnet test:
+  - When to use `mock_all_auths()` versus
+    `mock_all_auths_allowing_non_root_auth()`, and why the relaxed
+    variant silently masks missing `authorize_as_current_contract`
+    declarations until you hit testnet.
+  - `include_bytes!("…wasm")` does not trigger a rebuild of the wasm
+    when the contract's `.rs` files change — workarounds + the v0.9.x
+    `register_wasm_from_workspace` plan.
+  - `cache_file` math for cheap CI (≈ 175 live RPC calls per build
+    without it; zero with it).
+  - Pointer to `tracing(true)` + `print_trace()` as the existing tool
+    for debugging `Error(Auth, InvalidAction)` panics, with the
+    `print_auth_tree()` / `last_auth_failure()` plan for v0.9.0.
+  - `into_val(&env)` ergonomics on `ForkedEnv` and the planned
+    `IntoVal` impl path.
+
+### Notes
+- Pure documentation release — no code changes, no API additions, no
+  binary churn. Two of the five "missing features" the integrator
+  reported (`tracing(true)` + `print_trace()`, `cache_file`) already
+  shipped in v0.7/v0.8 and the gap was discoverability.
+- v0.9.0 will be a diagnostics & DX release covering the genuinely
+  missing items: `print_auth_tree`, `last_auth_failure`,
+  `ForkConfig::strict_auth(true)`, and the wasm-rebuild trap.
+
 ## [0.8.7] — 2026-04-27
 
 ### Added
@@ -305,7 +335,8 @@ non-standard extensions, not bare overrides of Stellar RPC methods.
   from a Soroban RPC endpoint. Compatible with the `LedgerSnapshot` JSON
   format (`stellar snapshot create` interop).
 
-[Unreleased]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.7...HEAD
+[Unreleased]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.8...HEAD
+[0.8.8]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.7...v0.8.8
 [0.8.7]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/lobotomoe/soroban-fork/compare/v0.8.4...v0.8.5

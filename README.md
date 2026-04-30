@@ -274,7 +274,7 @@ What makes the toolset matter, in one test:
 
 Two cheatcode calls and a contract is callable. That's the Foundry-`vm.etch`-equivalent — the headline reason this toolset exists. Live in [`server_cheatcode_only_deploy_coexists_with_mainnet`](tests/server_smoke.rs); end-to-end against mainnet, ~70 LoC.
 
-### Methods supported in v0.8.7
+### Methods supported in v0.8.8
 
 - **`getHealth`** — fork status + latest ledger
 - **`getVersionInfo`** — server version + protocol version
@@ -379,7 +379,7 @@ client can distinguish "this works against any Stellar RPC" from
   staleness) past thresholds without orchestrating real
   transactions.
 
-### What v0.8.7 server does NOT support
+### What v0.8.8 server does NOT support
 
 Listed up front so nothing surprises you:
 
@@ -580,6 +580,85 @@ The cache file uses the same JSON format as `stellar snapshot create` (`LedgerSn
 Cache is saved automatically when `ForkedEnv` is dropped, including all entries
 that were lazy-fetched during the test. This means the second run of a test with
 `cache_file` set will be fully local -- zero RPC calls.
+
+## Common pitfalls
+
+Real things that have tripped up integrators wiring soroban-fork into Blend-style
+mainnet tests. Read these before opening an issue.
+
+### `mock_all_auths()` vs `mock_all_auths_allowing_non_root_auth()`
+
+Reach for plain **`env.mock_all_auths()`**. Don't use `mock_all_auths_allowing_non_root_auth()` unless
+you understand exactly which authorisations it disables.
+
+The `_allowing_non_root_auth` variant skips authorisation checks for *non-root*
+(cross-contract callee) frames. If your contract makes a self-call (`to=self`)
+or relies on `authorize_as_current_contract` declarations, the relaxed mode
+**silently masks** missing auth declarations during fork tests — they pass
+locally and only fail on testnet with `Error(Auth, InvalidAction)`. By the
+time you see the testnet error, you've lost the trail back to the missing
+declaration.
+
+**Rule of thumb:** start with plain `mock_all_auths()`. Only switch to the
+relaxed variant when you can name which non-root authorisations you're
+intentionally bypassing — and document why in a comment.
+
+A `ForkConfig::strict_auth(true)` switch that refuses the relaxed variant
+on the env is planned for **v0.9.0**.
+
+### `include_bytes!("…wasm")` does not rebuild the wasm
+
+If your test loads a contract via
+`include_bytes!("../target/wasm32v1-none/release/my_contract.wasm")`, Cargo
+will **not** rebuild the wasm when you edit the contract's `.rs` files.
+`cargo test` rebuilds the test binary, which sees only whatever wasm bytes
+were on disk the last time `stellar contract build` ran.
+
+You will see tests pass against stale wasm. The symptom is "I fixed the
+contract but the test still observes the old behaviour."
+
+Workarounds (pick one):
+
+- **Rebuild manually:** add `stellar contract build` to your Makefile / justfile / CI step. Run it before `cargo test`.
+- **Cheap automation:** add a `build.rs` to your test crate that runs `stellar contract build` on the contract crate, with `cargo:rerun-if-changed=` lines pointing at the source files.
+- **Long-term:** a `ForkConfig::register_wasm_from_workspace(crate_name)` helper that rebuilds + caches by hash is planned for **v0.9.x**.
+
+### `cache_file` for cheap CI
+
+A typical Blend-style mainnet fork test fetches 30–40 ledger entries on the
+first run. Without `cache_file`, every CI run pays that round-trip cost — five
+tests × ~35 fetches ≈ 175 live RPC calls per CI build, gated by the upstream
+RPC's rate limits.
+
+Set `.cache_file("…")` once and check the file into git. Subsequent runs (local
+and CI) read entirely from the cache: zero RPC calls, full repro of the
+captured state. See [Cache format](#cache-format) above.
+
+```rust
+let env = ForkConfig::new(rpc_url)
+    .cache_file("tests/fixtures/blend_pool_cache.json")
+    .build()?;
+```
+
+### Debugging cross-contract auth chains
+
+When you see `Error(Auth, InvalidAction)` and the panic message alone isn't
+enough, enable `.tracing(true)` and call `env.print_trace()` after the failed
+call — the rolled-back frame surfaces which contract refused which
+authorisation. See [Tracing](#tracing--foundry-style-call-trees) above.
+
+A dedicated `env.print_auth_tree()` (current `AuthorizedInvocation` tree dump)
+and `env.last_auth_failure()` (structured info on the most recent
+`InvalidAction`) are planned for **v0.9.0** as the headline diagnostics
+upgrade.
+
+### `into_val(&env)` and `ForkedEnv`
+
+`ForkedEnv` derefs to `&Env`, but the `IntoVal` blanket impls don't follow the
+deref. If you write `something.into_val(&env)` in a test body where
+`env: ForkedEnv`, the compiler will reject it. Either pass `&*env` explicitly,
+or extract the conversion into a helper that takes `env: &Env`. A direct
+`IntoVal<ForkedEnv, Val>` impl is being evaluated for v0.9.x.
 
 ## Limitations
 
