@@ -8,7 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.3] — 2026-06-03
+## [0.9.4] — 2026-06-03
+
+### Fixed
+- **`getTransaction` now returns `resultXdr` + `resultMetaXdr`** for a found
+  transaction. The stellar SDKs decode both unconditionally and read the
+  Soroban invoke return value out of `resultMetaXdr.sorobanMeta.returnValue`;
+  the server previously emitted only a non-standard `returnValueXdr`, so
+  `server.getTransaction(hash)` threw client-side (`Buffer.from(undefined)`)
+  even though the transaction had applied. A real `sendTransaction` →
+  `getTransaction` poll loop (e.g. a browser dapp signing through the fork) now
+  completes. `returnValueXdr` is retained for direct consumers.
+
+### Added
+- Test accounts / clients can now drive a full UI-level deposit/withdraw flow
+  against the fork end-to-end (the fix above unblocks the JS SDK's poll loop).
 
 ### Fixed
 - **Forking a network whose protocol is newer than the linked

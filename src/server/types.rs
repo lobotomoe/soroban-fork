@@ -631,9 +631,20 @@ pub(crate) struct GetTransactionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) envelope_xdr: Option<String>,
     /// Base64-encoded `ScVal` of the host function's return value.
-    /// Present when `status == "SUCCESS"`.
+    /// Present when `status == "SUCCESS"`. Kept for direct consumers; the
+    /// stellar SDKs read the return value out of `result_meta_xdr` instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) return_value_xdr: Option<String>,
+    /// Base64-encoded `TransactionResult` XDR. The stellar SDKs decode this
+    /// unconditionally for a found transaction, so it must be present — a
+    /// missing field makes their `getTransaction` throw client-side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) result_xdr: Option<String>,
+    /// Base64-encoded `TransactionMeta` (V3) XDR. Carries the Soroban return
+    /// value under `sorobanMeta.returnValue`, which is where the SDKs read it
+    /// from. Also decoded unconditionally for a found transaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) result_meta_xdr: Option<String>,
     /// Plain-text host failure message when `status == "FAILED"`.
     /// Real `stellar-rpc` returns `errorResultXdr` here (a base64
     /// `TransactionResult` XDR). We don't yet build that XDR; v0.6

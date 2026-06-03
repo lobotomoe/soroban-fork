@@ -567,6 +567,8 @@ async fn handle_get_transaction(
             created_at: None,
             envelope_xdr: None,
             return_value_xdr: None,
+            result_xdr: None,
+            result_meta_xdr: None,
             error_message: None,
             applied_changes: None,
         },
@@ -577,6 +579,7 @@ async fn handle_get_transaction(
                     let bytes = scval.to_xdr(Limits::none()).map_err(|e| {
                         JsonRpcError::internal_error(format!("encode return ScVal: {e}"))
                     })?;
+                    let (result_xdr, result_meta_xdr) = build_result_xdrs(scval.clone(), true)?;
                     GetTransactionResponse {
                         status: "SUCCESS",
                         latest_ledger: latest.sequence,
@@ -584,24 +587,94 @@ async fn handle_get_transaction(
                         created_at: Some(r.created_at.to_string()),
                         envelope_xdr,
                         return_value_xdr: Some(BASE64.encode(&bytes)),
+                        result_xdr: Some(result_xdr),
+                        result_meta_xdr: Some(result_meta_xdr),
                         error_message: None,
                         applied_changes: Some(r.applied_changes),
                     }
                 }
-                Err(msg) => GetTransactionResponse {
-                    status: "FAILED",
-                    latest_ledger: latest.sequence,
-                    ledger: Some(r.ledger),
-                    created_at: Some(r.created_at.to_string()),
-                    envelope_xdr,
-                    return_value_xdr: None,
-                    error_message: Some(msg.clone()),
-                    applied_changes: Some(r.applied_changes),
-                },
+                Err(msg) => {
+                    // No return value on failure; emit a Void-return meta so the
+                    // SDKs (which decode result/meta unconditionally) don't throw.
+                    let (result_xdr, result_meta_xdr) =
+                        build_result_xdrs(soroban_env_host::xdr::ScVal::Void, false)?;
+                    GetTransactionResponse {
+                        status: "FAILED",
+                        latest_ledger: latest.sequence,
+                        ledger: Some(r.ledger),
+                        created_at: Some(r.created_at.to_string()),
+                        envelope_xdr,
+                        return_value_xdr: None,
+                        result_xdr: Some(result_xdr),
+                        result_meta_xdr: Some(result_meta_xdr),
+                        error_message: Some(msg.clone()),
+                        applied_changes: Some(r.applied_changes),
+                    }
+                }
             }
         }
     };
     serde_json::to_value(body).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+}
+
+/// Build the `(resultXdr, resultMetaXdr)` base64 pair the stellar SDKs decode
+/// for a found transaction. `return_value` is placed in
+/// `sorobanMeta.returnValue` (where the SDKs read the invoke result from), and
+/// `success` selects `TxSuccess`/`InvokeHostFunction::Success` vs the failed
+/// variants. The ledger-change deltas are left empty — the fork applies writes
+/// directly to its snapshot source, so per-tx meta deltas aren't reconstructed.
+fn build_result_xdrs(
+    return_value: soroban_env_host::xdr::ScVal,
+    success: bool,
+) -> Result<(String, String), JsonRpcError> {
+    use soroban_env_host::xdr::{
+        ExtensionPoint, Hash, InvokeHostFunctionResult, LedgerEntryChanges, OperationResult,
+        OperationResultTr, SorobanTransactionMeta, SorobanTransactionMetaExt, TransactionMeta,
+        TransactionMetaV3, TransactionResult, TransactionResultExt, TransactionResultResult, VecM,
+    };
+    let enc = |e: String| JsonRpcError::internal_error(format!("encode tx xdr: {e}"));
+
+    let meta = TransactionMeta::V3(TransactionMetaV3 {
+        ext: ExtensionPoint::V0,
+        tx_changes_before: LedgerEntryChanges(VecM::default()),
+        operations: VecM::default(),
+        tx_changes_after: LedgerEntryChanges(VecM::default()),
+        soroban_meta: Some(SorobanTransactionMeta {
+            ext: SorobanTransactionMetaExt::V0,
+            events: VecM::default(),
+            return_value,
+            diagnostic_events: VecM::default(),
+        }),
+    });
+    let meta_xdr = BASE64.encode(
+        &meta
+            .to_xdr(Limits::none())
+            .map_err(|e| enc(e.to_string()))?,
+    );
+
+    let op = OperationResult::OpInner(OperationResultTr::InvokeHostFunction(if success {
+        InvokeHostFunctionResult::Success(Hash([0u8; 32]))
+    } else {
+        InvokeHostFunctionResult::Trapped
+    }));
+    let ops: VecM<OperationResult> = vec![op]
+        .try_into()
+        .map_err(|_| enc("operation result vec".to_string()))?;
+    let result = TransactionResult {
+        fee_charged: 0,
+        result: if success {
+            TransactionResultResult::TxSuccess(ops)
+        } else {
+            TransactionResultResult::TxFailed(ops)
+        },
+        ext: TransactionResultExt::V0,
+    };
+    let result_xdr = BASE64.encode(
+        &result
+            .to_xdr(Limits::none())
+            .map_err(|e| enc(e.to_string()))?,
+    );
+    Ok((result_xdr, meta_xdr))
 }
 
 async fn handle_fork_set_ledger_entry(
@@ -1502,5 +1575,40 @@ fn hex_nibble(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_env_host::xdr::{ReadXdr, ScVal, TransactionMeta, TransactionResult};
+
+    #[test]
+    fn result_xdrs_round_trip_and_carry_return_value() {
+        // The SDKs decode resultXdr + resultMetaXdr unconditionally for a found
+        // transaction, and read the invoke return value out of the meta's
+        // sorobanMeta.returnValue. Verify both round-trip and the value lands.
+        let (result_b64, meta_b64) = build_result_xdrs(ScVal::I32(42), true).expect("build xdrs");
+
+        let result =
+            TransactionResult::from_xdr(BASE64.decode(&result_b64).expect("b64"), Limits::none())
+                .expect("decode TransactionResult");
+        assert!(matches!(
+            result.result,
+            soroban_env_host::xdr::TransactionResultResult::TxSuccess(_)
+        ));
+
+        let meta =
+            TransactionMeta::from_xdr(BASE64.decode(&meta_b64).expect("b64"), Limits::none())
+                .expect("decode TransactionMeta");
+        match meta {
+            TransactionMeta::V3(v3) => {
+                assert_eq!(
+                    v3.soroban_meta.expect("soroban meta").return_value,
+                    ScVal::I32(42)
+                );
+            }
+            _ => panic!("expected TransactionMeta::V3"),
+        }
     }
 }
