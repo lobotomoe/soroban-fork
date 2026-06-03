@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-06-03
+
+### Fixed
+- **Forking a network whose protocol is newer than the linked
+  `soroban-env-host` no longer panics.** Previously `build()` passed the live
+  ledger's protocol version straight to the host; once a chain upgraded past the
+  host's supported protocol (e.g. mainnet on protocol 26 against a protocol-25
+  host) the VM aborted with `"ledger protocol version too new for host"` before
+  any contract code ran. `build()` now caps the protocol to the host's own
+  ceiling (`meta::INTERFACE_VERSION.protocol`) by default, so the fork runs
+  under the host's (older) semantics instead of crashing. Bumping the
+  `soroban-env-host` dependency raises the ceiling automatically.
+
+### Changed
+- `max_protocol_version` is now a "pin below the host ceiling" knob rather than
+  the only trigger for capping: a requested value above what the host supports
+  is clamped down to the host max, and capping happens by default even when it
+  is unset. Setting it remains optional.
+
 ## [0.9.2] — 2026-05-01
 
 ### Added

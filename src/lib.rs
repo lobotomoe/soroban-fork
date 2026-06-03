@@ -576,11 +576,15 @@ impl ForkConfig {
         self
     }
 
-    /// Cap the protocol version the VM reports to contracts.
+    /// Pin the protocol version the VM reports to contracts BELOW the host's
+    /// own ceiling.
     ///
-    /// Useful when the real network has upgraded past what your `soroban-sdk`
-    /// version knows — the contract sees `max`, not the live value, and
-    /// protocol-specific asserts still pass.
+    /// By default a fork already caps to the linked `soroban-env-host`'s max
+    /// supported protocol (`meta::INTERFACE_VERSION.protocol`), so a live
+    /// network that has upgraded past your `soroban-sdk` version no longer
+    /// panics — it runs under the host's older semantics. Use this only to pin
+    /// even lower (e.g. to reproduce a pre-upgrade ledger's behaviour); a value
+    /// above the host's ceiling is clamped down to it.
     pub fn max_protocol_version(mut self, version: u32) -> Self {
         self.max_protocol_version = Some(version);
         self
@@ -713,16 +717,26 @@ impl ForkConfig {
         };
 
         let sequence = self.pinned_ledger.unwrap_or(latest.sequence);
-        let protocol_version = match self.max_protocol_version {
-            Some(max) if latest.protocol_version > max => {
-                info!(
-                    "soroban-fork: capping protocol version {} -> {} (max_protocol_version)",
-                    latest.protocol_version, max
-                );
-                max
-            }
-            _ => latest.protocol_version,
-        };
+
+        // The linked soroban-env-host only implements protocol versions up to
+        // `meta::INTERFACE_VERSION.protocol`; handing its VM a newer ledger
+        // protocol panics deep in the host ("ledger protocol version too new for
+        // host"). So cap to the host's own ceiling by DEFAULT — a fork against a
+        // chain that has since upgraded its protocol then runs under the host's
+        // (older) semantics instead of aborting. `max_protocol_version` can pin
+        // even lower, but never above what the host supports. Bumping the
+        // soroban-env-host dependency raises this ceiling automatically, so the
+        // same code keeps working across protocol upgrades.
+        let host_max = soroban_env_host::meta::INTERFACE_VERSION.protocol;
+        let protocol_version =
+            cap_protocol_version(latest.protocol_version, self.max_protocol_version, host_max);
+        if protocol_version != latest.protocol_version {
+            info!(
+                "soroban-fork: capping protocol version {} -> {} \
+                 (host supports <= {}, max_protocol_version = {:?})",
+                latest.protocol_version, protocol_version, host_max, self.max_protocol_version
+            );
+        }
         let timestamp = self.pinned_timestamp.unwrap_or(latest.close_time);
 
         let sdk_ledger_info = soroban_env_host::LedgerInfo {
@@ -825,6 +839,17 @@ impl ForkConfig {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Resolve the protocol version a fork should report to contracts.
+///
+/// Never exceeds `host_max` (what the linked `soroban-env-host` actually
+/// implements) — running a newer protocol than the host knows panics its VM.
+/// An optional caller `requested_max` can pin even lower, but is itself clamped
+/// to `host_max`. Otherwise the live ledger's protocol passes through unchanged.
+fn cap_protocol_version(latest: u32, requested_max: Option<u32>, host_max: u32) -> u32 {
+    let effective_max = requested_max.map_or(host_max, |m| m.min(host_max));
+    latest.min(effective_max)
+}
+
 fn do_save_cache(
     source: &RpcSnapshotSource,
     path: &std::path::Path,
@@ -877,6 +902,21 @@ mod tests {
         assert_eq!(cfg.pinned_timestamp, Some(999));
         assert_eq!(cfg.max_protocol_version, Some(25));
         assert!(cfg.tracing);
+    }
+
+    #[test]
+    fn cap_protocol_version_clamps_to_host_and_request() {
+        // Live ledger newer than the host: clamp to the host ceiling so the VM
+        // doesn't panic (the bug this fixes — proto 26 ledger, proto 25 host).
+        assert_eq!(cap_protocol_version(26, None, 25), 25);
+        // Live ledger within host support: pass through unchanged.
+        assert_eq!(cap_protocol_version(22, None, 25), 22);
+        // Caller pins lower than both: honored.
+        assert_eq!(cap_protocol_version(26, Some(21), 25), 21);
+        // Caller asks ABOVE the host ceiling: clamped to the host, never above.
+        assert_eq!(cap_protocol_version(26, Some(99), 25), 25);
+        // Exactly at the ceiling: allowed.
+        assert_eq!(cap_protocol_version(25, None, 25), 25);
     }
 
     #[test]
