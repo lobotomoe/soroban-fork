@@ -78,6 +78,19 @@ use soroban_sdk::{Env, IntoVal, Symbol, Val};
 /// and [`ForkedEnv::warp_ledger`] to keep the two advancement modes in sync.
 const LEDGER_INTERVAL_SECONDS: u64 = 5;
 
+/// Seconds added to the fork-point close time when deriving the default ledger
+/// timestamp.
+///
+/// The fork pins its clock to the fork-point ledger, but ledger entries are
+/// lazy-fetched **after** that point, at the chain's current (slightly newer)
+/// state. An entry the network updated in that window carries a `last_modified`
+/// time later than the fork point, so a contract computing a time delta
+/// (`ledger.timestamp() - entry.last_time`, e.g. Blend interest accrual)
+/// underflows and traps — intermittently, depending on the fetch race. Nudging
+/// the default clock ahead of the fork point keeps those deltas non-negative.
+/// Override the exact value with [`ForkConfig::pinned_timestamp`].
+const DEFAULT_FORK_TIME_BUFFER_SECONDS: u64 = 3_600;
+
 // ---------------------------------------------------------------------------
 // ForkedEnv
 // ---------------------------------------------------------------------------
@@ -737,7 +750,14 @@ impl ForkConfig {
                 latest.protocol_version, protocol_version, host_max, self.max_protocol_version
             );
         }
-        let timestamp = self.pinned_timestamp.unwrap_or(latest.close_time);
+        // Default the clock slightly ahead of the fork point so time deltas
+        // against lazily-fetched newer entries stay non-negative (see
+        // DEFAULT_FORK_TIME_BUFFER_SECONDS). `pinned_timestamp` overrides exactly.
+        let timestamp = self.pinned_timestamp.unwrap_or_else(|| {
+            latest
+                .close_time
+                .saturating_add(DEFAULT_FORK_TIME_BUFFER_SECONDS)
+        });
 
         let sdk_ledger_info = soroban_env_host::LedgerInfo {
             protocol_version,

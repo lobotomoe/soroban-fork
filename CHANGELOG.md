@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5] — 2026-06-04
+
+### Fixed
+- **Default ledger timestamp is nudged ahead of the fork point** to keep
+  time-delta contract math from underflowing. The fork pins its clock to the
+  fork-point ledger's close time, but ledger entries are lazy-fetched *after*
+  that point at the chain's current (slightly newer) state. An entry the
+  network updated in that window carries a `last_modified` time later than the
+  fork clock, so a contract computing `ledger.timestamp() - entry.last_time`
+  (e.g. Blend interest accrual inside `get_reserve`) underflowed and trapped —
+  intermittently, depending on the build-vs-fetch race. The default timestamp
+  is now `fork_point.close_time + 3600s`, which absorbs the realistic fetch
+  skew. `ForkConfig::pinned_timestamp` still sets an exact value (no buffer).
+  This removed a ~20% intermittent trap rate observed forking a live mainnet
+  Blend pool.
+
 ## [0.9.4] — 2026-06-03
 
 ### Fixed
